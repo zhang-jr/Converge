@@ -420,3 +420,189 @@ def set_global_tracer(tracer: Tracer) -> None:
     """
     global _global_tracer
     _global_tracer = tracer
+
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry integration (optional — requires [otel] extras)
+# ---------------------------------------------------------------------------
+
+
+class OTelTracer(Tracer):
+    """Tracer subclass that emits OpenTelemetry spans.
+
+    Falls back gracefully to JSON-only logging when the ``opentelemetry-sdk``
+    package is not installed, making the ``[otel]`` extras truly optional.
+
+    The base class :class:`Tracer` behaviour is always preserved: all events
+    are written to the structured JSON logger regardless of OTel availability.
+
+    Args:
+        agent_id: ID of the agent being traced.
+        service_name: OTel service name (default ``"agent-framework"``).
+        otlp_endpoint: gRPC endpoint for OTLP exporter, e.g.
+            ``"http://localhost:4317"``. If ``None``, uses ConsoleSpanExporter.
+        logger: Optional custom logger (forwarded to :class:`Tracer`).
+        log_level: Logging level (forwarded to :class:`Tracer`).
+    """
+
+    def __init__(
+        self,
+        agent_id: str = "",
+        service_name: str = "agent-framework",
+        otlp_endpoint: str | None = None,
+        logger: logging.Logger | None = None,
+        log_level: int = logging.INFO,
+    ) -> None:
+        super().__init__(agent_id=agent_id, logger=logger, log_level=log_level)
+        self._otel_enabled = False
+        self._otel_span: Any = None
+        self._otel_tracer: Any = None
+
+        try:
+            from opentelemetry import trace as otel_trace
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+
+            resource = Resource.create({"service.name": service_name, "agent.id": agent_id})
+            provider = TracerProvider(resource=resource)
+
+            if otlp_endpoint:
+                try:
+                    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                        OTLPSpanExporter,
+                    )
+                    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+                    exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
+                    provider.add_span_processor(BatchSpanProcessor(exporter))
+                except ImportError:
+                    self._logger.warning(
+                        "opentelemetry-exporter-otlp not installed; "
+                        "falling back to ConsoleSpanExporter"
+                    )
+                    self._add_console_exporter(provider)
+            else:
+                self._add_console_exporter(provider)
+
+            otel_trace.set_tracer_provider(provider)
+            self._otel_tracer = otel_trace.get_tracer(service_name)
+            self._otel_enabled = True
+
+        except ImportError:
+            self._logger.debug(
+                "opentelemetry-sdk not installed; OTel spans disabled. "
+                "Install with: pip install agent-framework[otel]"
+            )
+
+    @staticmethod
+    def _add_console_exporter(provider: Any) -> None:
+        try:
+            from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+            from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+                InMemorySpanExporter,
+            )
+
+            provider.add_span_processor(SimpleSpanProcessor(InMemorySpanExporter()))
+        except ImportError:
+            # ConsoleSpanExporter as ultimate fallback
+            try:
+                from opentelemetry.sdk.trace.export import (
+                    ConsoleSpanExporter,
+                    SimpleSpanProcessor,
+                )
+
+                provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+            except ImportError:
+                pass
+
+    def start_trace(self, trace_id: str | None = None) -> str:
+        """Start a trace and optionally open an OTel root span.
+
+        Args:
+            trace_id: Optional custom trace ID.
+
+        Returns:
+            The trace ID string.
+        """
+        tid = super().start_trace(trace_id)
+        if self._otel_enabled and self._otel_tracer is not None:
+            self._otel_span = self._otel_tracer.start_span(
+                name=f"reconcile.{self._agent_id}",
+                attributes={"trace_id": tid, "agent_id": self._agent_id},
+            )
+        return tid
+
+    def log_step(
+        self,
+        step_output: StepOutput,
+        state_diff: dict[str, Any] | None = None,
+    ) -> str:
+        """Log a step as a JSON event and an OTel span event.
+
+        Args:
+            step_output: The step output to log.
+            state_diff: State changes made in this step.
+
+        Returns:
+            Span ID string.
+        """
+        span_id = super().log_step(step_output, state_diff)
+        if self._otel_enabled and self._otel_span is not None:
+            self._otel_span.add_event(
+                name="step",
+                attributes={
+                    "step_number": step_output.step_number,
+                    "action": step_output.action[:256],
+                    "reasoning": (step_output.reasoning or "")[:512],
+                    "span_id": span_id,
+                },
+            )
+        return span_id
+
+    def log_tool_call(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+        result: Any,
+        success: bool = True,
+        error: str | None = None,
+        duration_ms: float = 0.0,
+    ) -> str:
+        """Log a tool call as a JSON event and an OTel span event.
+
+        Args:
+            tool_name: Name of the tool.
+            params: Tool parameters.
+            result: Tool result.
+            success: Whether the call succeeded.
+            error: Error message if failed.
+            duration_ms: Execution time in milliseconds.
+
+        Returns:
+            Span ID string.
+        """
+        span_id = super().log_tool_call(tool_name, params, result, success, error, duration_ms)
+        if self._otel_enabled and self._otel_span is not None:
+            self._otel_span.add_event(
+                name="tool_call",
+                attributes={
+                    "tool_name": tool_name,
+                    "success": success,
+                    "duration_ms": duration_ms,
+                    "error": error or "",
+                    "span_id": span_id,
+                },
+            )
+        return span_id
+
+    def end_trace(self, status: str = "completed") -> None:
+        """End the trace and close the OTel root span.
+
+        Args:
+            status: Final status of the trace.
+        """
+        super().end_trace(status)
+        if self._otel_enabled and self._otel_span is not None:
+            self._otel_span.set_attribute("final_status", status)
+            self._otel_span.end()
+            self._otel_span = None

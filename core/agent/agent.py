@@ -28,6 +28,7 @@ from probes.quality_probe import DefaultQualityProbe, QualityProbe
 
 if TYPE_CHECKING:
     from core.runtime.agent_runtime import AgentRuntime
+    from core.runtime.human_intervention import HumanInterventionHandler
     from core.state.state_store import StateStore
     from tools.registry import ToolRegistry
 
@@ -45,6 +46,7 @@ class AgentReconcileLoop(ReconcileLoop):
         tool_registry: ToolRegistry | None = None,
         quality_probe: QualityProbe | None = None,
         tracer: Tracer | None = None,
+        human_intervention_handler: HumanInterventionHandler | None = None,
     ) -> None:
         super().__init__(
             state_store=state_store,
@@ -54,6 +56,7 @@ class AgentReconcileLoop(ReconcileLoop):
             safety_max_steps=agent.config.safety_max_steps,
             confidence_threshold=agent.config.confidence_threshold,
             agent_id=agent.config.agent_id,
+            human_intervention_handler=human_intervention_handler,
         )
         self._agent = agent
 
@@ -127,6 +130,7 @@ class Agent:
         tool_registry: ToolRegistry | None = None,
         quality_probe: QualityProbe | None = None,
         tracer: Tracer | None = None,
+        human_intervention_handler: HumanInterventionHandler | None = None,
     ) -> None:
         """Initialize the agent.
 
@@ -137,6 +141,7 @@ class Agent:
             tool_registry: ToolRegistry for tool access.
             quality_probe: QualityProbe for output evaluation.
             tracer: Tracer for observability.
+            human_intervention_handler: Handler for human approval decisions.
         """
         self._config = config
         self._runtime = runtime
@@ -144,6 +149,7 @@ class Agent:
         self._tool_registry = tool_registry
         self._quality_probe = quality_probe or DefaultQualityProbe()
         self._tracer = tracer or Tracer(agent_id=config.agent_id)
+        self._human_intervention_handler = human_intervention_handler
         self._llm_client: Any = None
 
     @property
@@ -174,6 +180,7 @@ class Agent:
             tool_registry=self._tool_registry,
             quality_probe=self._quality_probe,
             tracer=self._tracer,
+            human_intervention_handler=self._human_intervention_handler,
         )
 
         return await loop.run(desired_state)

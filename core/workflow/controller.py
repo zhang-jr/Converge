@@ -34,6 +34,7 @@ from errors.exceptions import (
 
 if TYPE_CHECKING:
     from core.runtime.agent_runtime import AgentRuntime
+    from core.runtime.human_intervention import HumanInterventionHandler
 
 
 class WorkflowController:
@@ -55,13 +56,20 @@ class WorkflowController:
             result = await controller.run(spec)
     """
 
-    def __init__(self, runtime: AgentRuntime) -> None:
+    def __init__(
+        self,
+        runtime: AgentRuntime,
+        human_intervention_handler: HumanInterventionHandler | None = None,
+    ) -> None:
         """Initialize the workflow controller.
 
         Args:
             runtime: The AgentRuntime used to execute individual agent steps.
+            human_intervention_handler: Handler for step approval decisions.
+                If None, on_approval_required() auto-approves (for testing).
         """
         self._runtime = runtime
+        self._human_intervention_handler = human_intervention_handler
 
     async def run(self, spec: WorkflowSpec) -> WorkflowExecutionResult:
         """Execute a workflow spec.
@@ -307,8 +315,8 @@ class WorkflowController:
     ) -> bool:
         """Called when a step requires human approval before executing.
 
-        Override this in subclasses to implement interactive approval UX.
-        Default implementation auto-approves (suitable for testing).
+        If a HumanInterventionHandler was provided, delegates to it.
+        Otherwise auto-approves (suitable for testing).
 
         Args:
             step: The step awaiting approval.
@@ -317,6 +325,21 @@ class WorkflowController:
         Returns:
             True to approve (proceed), False to skip the step.
         """
+        if self._human_intervention_handler is not None:
+            from core.state.models import DesiredState, LoopContext
+
+            # Build a minimal LoopContext so the handler has some context
+            dummy_context = LoopContext(
+                desired_state=DesiredState(goal=step.goal),
+                current_step=0,
+                agent_id=step.step_id,
+            )
+            decision = await self._human_intervention_handler.request_approval(
+                reason=f"Workflow step '{step.name}' requires approval",
+                context=dummy_context,
+                pending_action={"step_id": step.step_id, "goal": step.goal},
+            )
+            return decision.approved
         return True
 
 

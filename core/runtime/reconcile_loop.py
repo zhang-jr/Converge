@@ -30,6 +30,7 @@ from observability.tracer import Tracer
 from probes.quality_probe import DefaultQualityProbe, ProbeResult, QualityProbe
 
 if TYPE_CHECKING:
+    from core.runtime.human_intervention import HumanInterventionHandler
     from core.state.state_store import StateStore
     from tools.base import ToolBase
     from tools.registry import ToolRegistry
@@ -75,6 +76,7 @@ class ReconcileLoop(ABC):
         retry_on_conflict: bool = True,
         max_conflict_retries: int = 3,
         agent_id: str = "",
+        human_intervention_handler: HumanInterventionHandler | None = None,
     ) -> None:
         self._state_store = state_store
         self._tool_registry = tool_registry
@@ -85,6 +87,7 @@ class ReconcileLoop(ABC):
         self._retry_on_conflict = retry_on_conflict
         self._max_conflict_retries = max_conflict_retries
         self._agent_id = agent_id
+        self._human_intervention_handler = human_intervention_handler
 
     async def run(self, desired_state: DesiredState) -> ReconcileResult:
         """Execute the reconcile loop until convergence or failure.
@@ -286,18 +289,36 @@ class ReconcileLoop(ABC):
         self,
         tool: ToolBase,
         params: dict[str, Any],
+        context: LoopContext | None = None,
     ) -> ToolCall:
         """Execute a tool and return the result.
 
+        High-risk tools trigger human intervention before execution.
         Handles error wrapping and timing.
 
         Args:
             tool: The tool to execute.
             params: Parameters for the tool.
+            context: Current loop context (required for high-risk approval).
 
         Returns:
             ToolCall record with results.
         """
+        # High-risk gate: require human approval before execution
+        if tool.risk_level == "high" and context is not None:
+            decision = await self.on_human_intervention_needed(
+                reason=f"High-risk tool '{tool.name}' requires approval",
+                context=context,
+                pending_action={"tool": tool.name, "params": params},
+            )
+            if not decision.approved:
+                return ToolCall(
+                    tool_name=tool.name,
+                    params=params,
+                    success=False,
+                    error=f"Human rejected high-risk tool '{tool.name}': {decision.feedback}",
+                )
+
         start = time.monotonic()
         try:
             result = await tool.execute(params)
@@ -389,20 +410,28 @@ class ReconcileLoop(ABC):
         self,
         reason: str,
         context: LoopContext,
+        pending_action: dict[str, Any] | None = None,
     ) -> HumanDecision:
         """Called when human intervention is required.
 
-        Override to implement human-in-the-loop interaction.
-        Default implementation auto-approves (for testing).
+        If a HumanInterventionHandler was provided at construction time,
+        delegates to it. Otherwise auto-approves (suitable for testing).
 
         Args:
             reason: Why intervention is needed.
             context: Current loop context.
+            pending_action: Optional description of the pending action.
 
         Returns:
             HumanDecision with approval and feedback.
         """
         self._tracer.log_human_intervention(reason)
+        if self._human_intervention_handler is not None:
+            return await self._human_intervention_handler.request_approval(
+                reason=reason,
+                context=context,
+                pending_action=pending_action,
+            )
         return HumanDecision(
             approved=True,
             feedback="Auto-approved (default implementation)",

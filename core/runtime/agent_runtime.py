@@ -12,11 +12,13 @@ from typing import TYPE_CHECKING, Any
 
 from core.state.models import AgentConfig, DesiredState, ReconcileResult
 from core.state.sqlite_store import SQLiteStateStore
+from observability.metrics import MetricsCollector, get_global_metrics
 from observability.tracer import Tracer
 from probes.quality_probe import DefaultQualityProbe, QualityProbe
 from tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
+    from core.runtime.human_intervention import HumanInterventionHandler
     from core.state.state_store import StateStore
 
 
@@ -50,6 +52,8 @@ class AgentRuntime:
         tool_registry: ToolRegistry | None = None,
         quality_probe: QualityProbe | None = None,
         db_path: str = ":memory:",
+        metrics_collector: MetricsCollector | None = None,
+        human_intervention_handler: HumanInterventionHandler | None = None,
     ) -> None:
         """Initialize the agent runtime.
 
@@ -58,6 +62,10 @@ class AgentRuntime:
             tool_registry: ToolRegistry instance. If None, creates new one.
             quality_probe: QualityProbe instance. If None, uses default.
             db_path: Path for SQLite database if creating default StateStore.
+            metrics_collector: MetricsCollector for recording run metrics.
+                If None, uses the global collector.
+            human_intervention_handler: Handler for human-in-the-loop decisions.
+                If None, all interventions auto-approve.
         """
         self._state_store = state_store
         self._owns_state_store = state_store is None
@@ -66,6 +74,8 @@ class AgentRuntime:
         self._quality_probe = quality_probe or DefaultQualityProbe()
         self._tracers: dict[str, Tracer] = {}
         self._initialized = False
+        self._metrics = metrics_collector or get_global_metrics()
+        self._human_intervention_handler = human_intervention_handler
 
     @property
     def state_store(self) -> StateStore:
@@ -162,9 +172,12 @@ class AgentRuntime:
             tool_registry=self._tool_registry,
             quality_probe=self._quality_probe,
             tracer=self.get_tracer(config.agent_id),
+            human_intervention_handler=self._human_intervention_handler,
         )
 
-        return await agent.run(desired_state)
+        result = await agent.run(desired_state)
+        self._metrics.record_run(result, agent_id=config.agent_id)
+        return result
 
     def run_sync(
         self,
