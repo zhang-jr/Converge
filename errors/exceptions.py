@@ -337,6 +337,81 @@ class HumanInterventionRequired(AgentFrameworkError):
         self.pending_action = pending_action
 
 
+class WorkflowError(AgentFrameworkError):
+    """Base exception for workflow execution errors.
+
+    Args:
+        message: Human-readable error description.
+        workflow_id: ID of the workflow that raised the error.
+        context: Additional context information.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        workflow_id: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        ctx = context or {}
+        if workflow_id:
+            ctx["workflow_id"] = workflow_id
+        super().__init__(message, context=ctx)
+        self.workflow_id = workflow_id
+
+
+class WorkflowStepError(WorkflowError):
+    """Raised when a workflow step fails and its on_failure policy is 'fail'.
+
+    Args:
+        message: Human-readable error description.
+        step_id: The step that failed.
+        step_name: The step's human-readable name.
+        workflow_id: ID of the parent workflow.
+        context: Additional context information.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        step_id: str,
+        step_name: str,
+        workflow_id: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        ctx = context or {}
+        ctx["step_id"] = step_id
+        ctx["step_name"] = step_name
+        super().__init__(message, workflow_id=workflow_id, context=ctx)
+        self.step_id = step_id
+        self.step_name = step_name
+
+
+class WorkflowCycleError(WorkflowError):
+    """Raised when a workflow DAG contains a dependency cycle.
+
+    Args:
+        message: Human-readable error description.
+        cycle_path: The step IDs that form the cycle.
+        workflow_id: ID of the workflow with the cycle.
+        context: Additional context information.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cycle_path: list[str],
+        workflow_id: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        ctx = context or {}
+        ctx["cycle_path"] = cycle_path
+        super().__init__(message, workflow_id=workflow_id, context=ctx)
+        self.cycle_path = cycle_path
+
+
 class QualityProbeFailure(AgentFrameworkError):
     """Raised when a quality probe fails with hard_fail verdict.
 
