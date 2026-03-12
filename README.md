@@ -1,8 +1,22 @@
-# Agent Framework
+# Converge
 
-> 像 Kubernetes 管理容器一样，可靠地管理 Agent。
+<p align="center">
+  <img src="assets/banner.svg" alt="Converge Banner" width="100%"/>
+</p>
 
-一个受 Kubernetes 设计哲学启发的**生产可信 Agent 编排框架**。声明式 API、控制循环驱动状态收敛、可观测性是一等公民。
+> Manage Agents like Kubernetes manages containers.
+
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Pydantic](https://img.shields.io/badge/Pydantic-v2-red)
+![Async](https://img.shields.io/badge/Async-asyncio-purple)
+![LLM](https://img.shields.io/badge/LLM-LiteLLM-orange)
+
+**Converge** is a production-ready Python framework for orchestrating AI agents at scale, inspired by Kubernetes design philosophy.
+
+You declare *what* you want. Converge figures out *how* — driving agent behavior through self-correcting control loops until the desired state is reached. No hardcoded steps. No silent failures. Full observability by default.
+
+Built for engineers who need reliable, multi-agent systems they can trust in production.
 
 ## 设计理念
 
