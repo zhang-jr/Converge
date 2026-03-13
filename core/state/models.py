@@ -119,6 +119,8 @@ class StepOutput(BaseModel):
         state_changes: Keys that were modified in the state store.
         result: The output/result of this step.
         timestamp: When this step completed.
+        llm_tokens_used: Total tokens consumed by the LLM call in this step.
+        llm_latency_ms: Wall-clock latency of the LLM call in milliseconds.
     """
 
     step_number: int = Field(..., ge=1)
@@ -128,6 +130,8 @@ class StepOutput(BaseModel):
     state_changes: list[str] = Field(default_factory=list)
     result: Any = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+    llm_tokens_used: int = 0
+    llm_latency_ms: float = 0.0
 
 
 class LoopContext(BaseModel):
@@ -223,7 +227,7 @@ class AgentConfig(BaseModel):
     agent_id: str = Field(..., min_length=1)
     name: str = ""
     description: str = ""
-    model: str = Field(default="anthropic/claude-3-5-sonnet-20241022")
+    model: str | None = Field(default=None)
     system_prompt: str = ""
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, ge=1)

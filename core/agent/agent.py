@@ -12,6 +12,7 @@ Agents execute through the ReconcileLoop pattern.
 from __future__ import annotations
 
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 from core.runtime.reconcile_loop import ReconcileLoop
@@ -211,6 +212,9 @@ class Agent:
             response = await self._call_llm(messages)
             action, reasoning, tool_calls = self._parse_response(response)
 
+            llm_tokens_used: int = response.get("usage", {}).get("total_tokens", 0)
+            llm_latency_ms: float = response.get("latency_ms", 0.0)
+
             executed_tools = []
             for tc in tool_calls:
                 result = await self._execute_tool_call(tc)
@@ -222,6 +226,8 @@ class Agent:
                 reasoning=reasoning,
                 tool_calls=executed_tools,
                 result=self._summarize_results(executed_tools),
+                llm_tokens_used=llm_tokens_used,
+                llm_latency_ms=llm_latency_ms,
             )
 
         except Exception as e:
@@ -290,9 +296,71 @@ Respond with:
     async def _call_llm(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         """Call the LLM via LiteLLM.
 
-        This is a placeholder that returns a mock response.
-        In production, this would use litellm.acompletion().
+        Loads model config from environment (via core.config).
+        Falls back to mock response if litellm is unavailable (for testing).
+
+        Args:
+            messages: Conversation messages in OpenAI format.
+
+        Returns:
+            Response dict with choices, usage, and latency_ms.
         """
+        from core.config import LLM_API_BASE, LLM_MAX_TOKENS, LLM_MODEL, LLM_TEMPERATURE
+
+        tools_schema = self._build_tools_schema()
+
+        try:
+            import litellm
+
+            kwargs: dict[str, Any] = {
+                "model": self._config.model or LLM_MODEL,
+                "messages": messages,
+                "max_tokens": LLM_MAX_TOKENS,
+                "temperature": LLM_TEMPERATURE,
+            }
+            if LLM_API_BASE:
+                kwargs["api_base"] = LLM_API_BASE
+            if tools_schema:
+                kwargs["tools"] = tools_schema
+
+            t0 = time.monotonic()
+            response = await litellm.acompletion(**kwargs)
+            latency_ms = (time.monotonic() - t0) * 1000.0
+
+            # Normalize to a plain dict for consistent handling
+            usage = response.usage
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": response.choices[0].message.content or "",
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in (response.choices[0].message.tool_calls or [])
+                            ],
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": usage.prompt_tokens if usage else 0,
+                    "completion_tokens": usage.completion_tokens if usage else 0,
+                    "total_tokens": usage.total_tokens if usage else 0,
+                },
+                "latency_ms": latency_ms,
+            }
+
+        except ImportError:
+            # litellm not installed: return mock (useful for unit tests)
+            return self._mock_llm_response()
+
+    def _mock_llm_response(self) -> dict[str, Any]:
+        """Return a deterministic mock LLM response for testing."""
         return {
             "choices": [
                 {
@@ -300,20 +368,68 @@ Respond with:
                         "content": json.dumps({
                             "reasoning": "Analyzing the goal and determining next steps.",
                             "action": "Proceeding with goal analysis.",
-                            "tool_calls": [],
                         }),
+                        "tool_calls": [],
                     }
                 }
-            ]
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "latency_ms": 0.0,
         }
+
+    def _build_tools_schema(self) -> list[dict[str, Any]]:
+        """Build OpenAI-format tools schema from registered tools."""
+        if self._tool_registry is None or not self._config.tools:
+            return []
+        schema: list[dict[str, Any]] = []
+        for tool_name in self._config.tools:
+            try:
+                info = self._tool_registry.get_tool_info(tool_name)
+                schema.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": info.get("description", ""),
+                        "parameters": info.get(
+                            "parameters_schema", {"type": "object", "properties": {}}
+                        ),
+                    },
+                })
+            except KeyError:
+                pass
+        return schema
 
     def _parse_response(
         self,
         response: dict[str, Any],
     ) -> tuple[str, str, list[dict[str, Any]]]:
-        """Parse LLM response into action, reasoning, and tool calls."""
-        content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        """Parse LLM response into action, reasoning, and tool calls.
 
+        Handles both text responses (JSON with reasoning/action) and
+        LiteLLM tool_calls format.
+        """
+        message = response.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "") or ""
+        raw_tool_calls = message.get("tool_calls", []) or []
+
+        # Parse tool calls from LiteLLM format
+        tool_calls: list[dict[str, Any]] = []
+        for tc in raw_tool_calls:
+            func = tc.get("function", {})
+            tool_name = func.get("name", "")
+            arguments = func.get("arguments", "{}")
+            try:
+                parsed_args = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except (ValueError, TypeError):
+                parsed_args = {}
+            tool_calls.append({"name": tool_name, "params": parsed_args})
+
+        if tool_calls:
+            action = f"Calling tools: {', '.join(tc['name'] for tc in tool_calls)}"
+            reasoning = content
+            return action, reasoning, tool_calls
+
+        # Text response: try JSON parse first
         try:
             parsed = json.loads(content)
             return (
@@ -321,8 +437,8 @@ Respond with:
                 parsed.get("reasoning", ""),
                 parsed.get("tool_calls", []),
             )
-        except json.JSONDecodeError:
-            return (content, "", [])
+        except (json.JSONDecodeError, AttributeError):
+            return content[:200] if content else "No action", content, []
 
     async def _execute_tool_call(self, tool_call: dict[str, Any]) -> ToolCall:
         """Execute a single tool call."""
