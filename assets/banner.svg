@@ -33,8 +33,8 @@
   <circle cx="1052" cy="130" r="48" fill="none" stroke="#00d4aa" stroke-width="0.5" opacity="0.08" stroke-dasharray="2 8"/>
 
   <!-- Subtle bracket accents flanking title -->
-  <text x="388" y="158" font-family="'Courier New', Courier, monospace" font-size="52" fill="#00d4aa" opacity="0.18" font-weight="100">[</text>
-  <text x="798" y="158" font-family="'Courier New', Courier, monospace" font-size="52" fill="#00d4aa" opacity="0.18" font-weight="100">]</text>
+  <text x="320" y="150" font-family="'Courier New', Courier, monospace" font-size="72" fill="#00d4aa" opacity="0.18" font-weight="100">[</text>
+  <text x="813" y="150" font-family="'Courier New', Courier, monospace" font-size="72" fill="#00d4aa" opacity="0.18" font-weight="100">]</text>
 
   <!-- Main title -->
   <text
@@ -44,10 +44,13 @@
     font-size="68"
     font-weight="700"
     fill="#e6edf3"
-    letter-spacing="20">CONVERGE</text>
+    letter-spacing="20"
+    filter="url(#glow)">CONVERGE</text>
 
   <!-- Accent underline with glow -->
   <line x1="420" y1="166" x2="780" y2="166" stroke="#00d4aa" stroke-width="1.5" opacity="0.9" filter="url(#glow)"/>
+  <circle cx="345" cy="166" r="2.5" fill="#00d4aa" opacity="0.9" filter="url(#glow)"/>
+  <circle cx="828" cy="166" r="2.5" fill="#00d4aa" opacity="0.9" filter="url(#glow)"/>
 
   <!-- Subtitle -->
   <text
