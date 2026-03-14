@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from core.state.models import AgentConfig, DesiredState, ReconcileResult
+from core.state.models import AgentConfig, DesiredState, ReconcileResult, SubTask
 from core.state.sqlite_store import SQLiteStateStore
 from observability.metrics import MetricsCollector, get_global_metrics
 from observability.tracer import Tracer
@@ -256,3 +256,63 @@ class AgentRuntime:
                 result = await run_single(goal_config)
                 results.append(result)
             return results
+
+    async def run_subtask(self, subtask: SubTask) -> SubTask:
+        """Execute a SubTask by running an Agent.
+
+        Updates subtask.status to running/completed/failed and stores
+        result in subtask.output.
+
+        Args:
+            subtask: The SubTask to execute.
+
+        Returns:
+            Updated SubTask with status and output populated.
+        """
+        subtask.status = "running"
+        try:
+            result = await self.run(
+                goal=subtask.goal,
+                context={"parent_task_id": subtask.parent_task_id, "task_id": subtask.task_id},
+            )
+            subtask.status = "completed" if result.converged else "failed"
+            subtask.output = {
+                "converged": result.converged,
+                "total_steps": result.total_steps,
+                "status": result.status,
+            }
+            if not result.converged:
+                subtask.error = result.error
+        except Exception as e:
+            subtask.status = "failed"
+            subtask.error = str(e)
+        finally:
+            from datetime import datetime
+
+            subtask.completed_at = datetime.utcnow()
+        return subtask
+
+    async def run_subtasks(
+        self,
+        subtasks: list[SubTask],
+        parallel: bool = False,
+    ) -> list[SubTask]:
+        """Execute multiple SubTasks.
+
+        Uses sequential or parallel execution based on the parallel flag.
+
+        Args:
+            subtasks: List of SubTask instances to execute.
+            parallel: Whether to run subtasks in parallel (default sequential).
+
+        Returns:
+            List of completed SubTask instances.
+        """
+        await self.initialize()
+        if parallel:
+            return list(await asyncio.gather(*[self.run_subtask(st) for st in subtasks]))
+        results: list[SubTask] = []
+        for st in subtasks:
+            completed = await self.run_subtask(st)
+            results.append(completed)
+        return results

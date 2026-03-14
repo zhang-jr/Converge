@@ -6,6 +6,7 @@ Uses Literal for finite enumerations instead of plain strings.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any, Literal
 
@@ -68,6 +69,23 @@ class StateChangeEvent(BaseModel):
 # =============================================================================
 
 
+class ConvergenceCriterion(BaseModel):
+    """A single convergence criterion for structured termination.
+
+    Declares a condition that must be satisfied for the reconcile loop
+    to consider the goal achieved.
+
+    Attributes:
+        criterion_type: Type of criterion to check.
+        description: Human-readable description of this criterion.
+        params: Type-specific parameters (e.g., path for file_exists).
+    """
+
+    criterion_type: Literal["all_tests_pass", "lint_clean", "file_exists", "custom_probe"]
+    description: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
 class DesiredState(BaseModel):
     """Declaration of the desired state/goal for the reconcile loop.
 
@@ -84,6 +102,7 @@ class DesiredState(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     context: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    convergence_criteria: list[ConvergenceCriterion] = Field(default_factory=list)
 
 
 class ToolCall(BaseModel):
@@ -132,6 +151,7 @@ class StepOutput(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     llm_tokens_used: int = 0
     llm_latency_ms: float = 0.0
+    reflection: str = ""
 
 
 class LoopContext(BaseModel):
@@ -154,6 +174,7 @@ class LoopContext(BaseModel):
     state_snapshot: dict[str, Any] = Field(default_factory=dict)
     agent_id: str = ""
     trace_id: str = ""
+    execution_plan: ExecutionPlan | None = None
 
 
 class ReconcileResult(BaseModel):
@@ -234,3 +255,79 @@ class AgentConfig(BaseModel):
     tools: list[str] = Field(default_factory=list)
     safety_max_steps: int = Field(default=50, ge=1)
     confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
+
+# =============================================================================
+# Planning Models
+# =============================================================================
+
+
+class PlannedStep(BaseModel):
+    """A single step in an execution plan.
+
+    Attributes:
+        step_index: Zero-based index of this step in the plan.
+        goal: What this step should accomplish.
+        tool_hint: Suggested tool name (may be empty).
+        expected_output: Description of what success looks like.
+    """
+
+    step_index: int = Field(ge=0)
+    goal: str
+    tool_hint: str = ""
+    expected_output: str = ""
+
+
+class ExecutionPlan(BaseModel):
+    """An execution plan generated before the reconcile loop runs.
+
+    Contains a sequence of PlannedSteps that the agent intends to follow.
+
+    Attributes:
+        plan_id: Unique identifier for this plan.
+        agent_id: ID of the agent that generated the plan.
+        goal: The goal this plan addresses.
+        steps: Ordered list of planned steps.
+        created_at: When the plan was created.
+        reasoning: Why the plan was structured this way.
+    """
+
+    plan_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    agent_id: str = ""
+    goal: str = ""
+    steps: list[PlannedStep] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    reasoning: str = ""
+
+
+class SubTask(BaseModel):
+    """A subtask that can be delegated to an agent.
+
+    Supports parent-child relationships for task decomposition.
+
+    Attributes:
+        task_id: Unique identifier for this subtask.
+        parent_task_id: ID of the parent task (None if top-level).
+        agent_id: Which agent owns this subtask.
+        goal: What this subtask should accomplish.
+        status: Current execution status.
+        output: Result data after completion.
+        error: Error message if failed.
+        created_at: When the subtask was created.
+        completed_at: When the subtask finished.
+    """
+
+    task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    parent_task_id: str | None = None
+    agent_id: str = ""
+    goal: str
+    status: Literal["pending", "running", "completed", "failed"] = "pending"
+    output: Any = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: datetime | None = None
+
+
+# LoopContext references ExecutionPlan which is defined after it.
+# Pydantic v2 requires model_rebuild() to resolve forward references.
+LoopContext.model_rebuild()

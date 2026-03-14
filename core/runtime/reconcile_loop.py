@@ -14,8 +14,10 @@ from typing import TYPE_CHECKING, Any
 
 from core.state.models import (
     DesiredState,
+    ExecutionPlan,
     HumanDecision,
     LoopContext,
+    PlannedStep,
     ReconcileResult,
     StepOutput,
     ToolCall,
@@ -77,6 +79,8 @@ class ReconcileLoop(ABC):
         max_conflict_retries: int = 3,
         agent_id: str = "",
         human_intervention_handler: HumanInterventionHandler | None = None,
+        enable_planning: bool = False,
+        planning_mode: bool = False,
     ) -> None:
         self._state_store = state_store
         self._tool_registry = tool_registry
@@ -88,6 +92,58 @@ class ReconcileLoop(ABC):
         self._max_conflict_retries = max_conflict_retries
         self._agent_id = agent_id
         self._human_intervention_handler = human_intervention_handler
+        self._enable_planning = enable_planning
+        self._planning_mode = planning_mode
+
+    async def _planning_phase(
+        self,
+        desired_state: DesiredState,
+        context: LoopContext,
+    ) -> ExecutionPlan | None:
+        """Generate an ExecutionPlan before the loop starts.
+
+        Subclasses override this to use LLM for real planning.
+        Default implementation returns None (no planning).
+
+        The plan is persisted to StateStore under key ``f"plan/{context.trace_id}"``.
+
+        Args:
+            desired_state: The goal to plan for.
+            context: Current loop context.
+
+        Returns:
+            ExecutionPlan or None if planning is not implemented.
+        """
+        return None
+
+    async def _reflect_step(
+        self,
+        step_output: StepOutput,
+        planned_step: PlannedStep | None,
+        context: LoopContext,
+    ) -> str:
+        """Reflect on whether this step met the planned expectation.
+
+        Subclasses override this for LLM-based reflection.
+        Default: compare step result against expected_output using keyword matching.
+
+        Args:
+            step_output: Output from the current step.
+            planned_step: The corresponding planned step (may be None).
+            context: Current loop context.
+
+        Returns:
+            A reflection string stored in step_output.reflection.
+        """
+        if planned_step is None:
+            return ""
+        expected = planned_step.expected_output.lower()
+        result_str = str(step_output.result).lower() if step_output.result else ""
+        action_str = step_output.action.lower()
+        combined = result_str + " " + action_str
+        if expected and any(kw in combined for kw in expected.split()):
+            return f"Step met expectation: {planned_step.expected_output}"
+        return f"Step may not have met expectation: {planned_step.expected_output}"
 
     async def run(self, desired_state: DesiredState) -> ReconcileResult:
         """Execute the reconcile loop until convergence or failure.
@@ -117,112 +173,148 @@ class ReconcileLoop(ABC):
 
         await self.on_loop_start(context)
 
+        # Planning phase (if enabled)
+        if self._enable_planning:
+            plan = await self._planning_phase(desired_state, context)
+            if plan is not None:
+                context.execution_plan = plan
+                # Persist plan to StateStore
+                plan_key = f"plan/{trace_id}"
+                await self._state_store.put(
+                    plan_key,
+                    plan.model_dump(mode="json"),
+                    updated_by=self._agent_id or "system",
+                )
+                self._tracer.log_state_change(
+                    plan_key,
+                    old_value=None,
+                    new_value={"plan_id": plan.plan_id, "steps": len(plan.steps)},
+                    change_type="created",
+                )
+
         steps: list[StepOutput] = []
         final_status = "failed"
         error_message: str | None = None
 
-        try:
-            for step_num in range(1, self._safety_max_steps + 1):
-                context.current_step = step_num
-                context.state_snapshot = await self._get_state_snapshot()
+        # In planning_mode, only generate the plan — do not execute
+        if self._planning_mode:
+            if context.execution_plan is not None:
+                final_status = "converged"
+            else:
+                error_message = "Planning mode enabled but _planning_phase returned None"
+        else:
+            try:
+                for step_num in range(1, self._safety_max_steps + 1):
+                    context.current_step = step_num
+                    context.state_snapshot = await self._get_state_snapshot()
 
-                observed = await self._observe(context)
-                diff = await self._diff(observed, desired_state)
+                    observed = await self._observe(context)
+                    diff = await self._diff(observed, desired_state)
 
-                if not diff:
-                    final_status = "converged"
-                    break
-
-                step_output = await self._act(diff, context)
-                step_output.step_number = step_num
-                steps.append(step_output)
-                context.history = steps.copy()
-
-                self._tracer.log_step(step_output)
-
-                probe_result = await self._quality_probe.evaluate(step_output, context)
-                self._tracer.log_probe_result(probe_result, self._quality_probe.name)
-
-                if probe_result.verdict == "hard_fail":
-                    raise QualityProbeFailure(
-                        "Quality probe hard fail",
-                        verdict=probe_result.verdict,
-                        confidence=probe_result.confidence,
-                        probe_reason=probe_result.reason,
-                        agent_id=self._agent_id,
-                        step=step_num,
-                    )
-
-                if probe_result.confidence < self._confidence_threshold:
-                    decision = await self.on_human_intervention_needed(
-                        f"Confidence {probe_result.confidence:.2f} below threshold",
-                        context,
-                    )
-                    if not decision.approved:
-                        final_status = "human_intervention"
-                        error_message = "Human rejected continuation"
+                    if not diff:
+                        final_status = "converged"
                         break
 
-                await self.on_step_complete(step_output)
+                    step_output = await self._act(diff, context)
+                    step_output.step_number = step_num
 
-                if probe_result.should_converge:
-                    final_status = "converged"
-                    break
+                    # Reflect on step vs plan
+                    planned_step: PlannedStep | None = None
+                    if context.execution_plan:
+                        plan_steps = context.execution_plan.steps
+                        step_idx = step_num - 1
+                        if step_idx < len(plan_steps):
+                            planned_step = plan_steps[step_idx]
+                    reflection = await self._reflect_step(step_output, planned_step, context)
+                    step_output.reflection = reflection
 
-            else:
-                raise ConvergenceTimeoutError(
-                    f"Exceeded safety_max_steps ({self._safety_max_steps})",
-                    max_steps=self._safety_max_steps,
-                    steps_completed=len(steps),
-                    agent_id=self._agent_id,
-                )
+                    steps.append(step_output)
+                    context.history = steps.copy()
 
-        except ConvergenceTimeoutError:
-            final_status = "timeout"
-            error_message = f"Exceeded {self._safety_max_steps} steps"
-            raise
+                    self._tracer.log_step(step_output)
 
-        except LoopDetectedError as e:
-            final_status = "failed"
-            error_message = str(e)
-            await self.on_failure(e, len(steps))
-            raise
+                    probe_result = await self._quality_probe.evaluate(step_output, context)
+                    self._tracer.log_probe_result(probe_result, self._quality_probe.name)
 
-        except QualityProbeFailure as e:
-            final_status = "failed"
-            error_message = e.probe_reason
-            await self.on_failure(e, len(steps))
-            raise
+                    if probe_result.verdict == "hard_fail":
+                        raise QualityProbeFailure(
+                            "Quality probe hard fail",
+                            verdict=probe_result.verdict,
+                            confidence=probe_result.confidence,
+                            probe_reason=probe_result.reason,
+                            agent_id=self._agent_id,
+                            step=step_num,
+                        )
 
-        except HumanInterventionRequired:
-            final_status = "human_intervention"
+                    if probe_result.confidence < self._confidence_threshold:
+                        decision = await self.on_human_intervention_needed(
+                            f"Confidence {probe_result.confidence:.2f} below threshold",
+                            context,
+                        )
+                        if not decision.approved:
+                            final_status = "human_intervention"
+                            error_message = "Human rejected continuation"
+                            break
 
-        except Exception as e:
-            final_status = "failed"
-            error_message = str(e)
-            self._tracer.log_error(e)
-            await self.on_failure(e, len(steps))
-            raise
+                    await self.on_step_complete(step_output)
 
-        finally:
-            end_time = time.monotonic()
-            duration_ms = (end_time - start_time) * 1000
+                    if probe_result.should_converge:
+                        final_status = "converged"
+                        break
 
-            result = ReconcileResult(
-                status=final_status,
-                steps=steps,
-                final_state=await self._get_state_snapshot(),
-                total_steps=len(steps),
-                converged=(final_status == "converged"),
-                error=error_message,
-                duration_ms=duration_ms,
-                trace_id=trace_id,
-            )
+                else:
+                    raise ConvergenceTimeoutError(
+                        f"Exceeded safety_max_steps ({self._safety_max_steps})",
+                        max_steps=self._safety_max_steps,
+                        steps_completed=len(steps),
+                        agent_id=self._agent_id,
+                    )
 
-            if final_status == "converged":
-                await self.on_convergence(result)
+            except ConvergenceTimeoutError:
+                final_status = "timeout"
+                error_message = f"Exceeded {self._safety_max_steps} steps"
+                raise
 
-            self._tracer.end_trace(final_status)
+            except LoopDetectedError as e:
+                final_status = "failed"
+                error_message = str(e)
+                await self.on_failure(e, len(steps))
+                raise
+
+            except QualityProbeFailure as e:
+                final_status = "failed"
+                error_message = e.probe_reason
+                await self.on_failure(e, len(steps))
+                raise
+
+            except HumanInterventionRequired:
+                final_status = "human_intervention"
+
+            except Exception as e:
+                final_status = "failed"
+                error_message = str(e)
+                self._tracer.log_error(e)
+                await self.on_failure(e, len(steps))
+                raise
+
+        end_time = time.monotonic()
+        duration_ms = (end_time - start_time) * 1000
+
+        result = ReconcileResult(
+            status=final_status,
+            steps=steps,
+            final_state=await self._get_state_snapshot(),
+            total_steps=len(steps),
+            converged=(final_status == "converged"),
+            error=error_message,
+            duration_ms=duration_ms,
+            trace_id=trace_id,
+        )
+
+        if final_status == "converged":
+            await self.on_convergence(result)
+
+        self._tracer.end_trace(final_status)
 
         return result
 
@@ -466,9 +558,15 @@ class SimpleReconcileLoop(ReconcileLoop):
         diff: dict[str, Any],
         context: LoopContext,
     ) -> StepOutput:
-        """Execute the act callback if provided."""
+        """Execute the act callback if provided.
+
+        Handles both async and sync callbacks transparently.
+        """
         if self._act_callback is not None:
-            return await self._act_callback(diff, context, self)
+            result = self._act_callback(diff, context, self)
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
 
         return StepOutput(
             step_number=context.current_step,

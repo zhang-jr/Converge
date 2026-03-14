@@ -6,10 +6,13 @@ converge (goal achieved), or fail (unrecoverable error).
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
+
+from core.state.models import ConvergenceCriterion
 
 if TYPE_CHECKING:
     from core.state.models import LoopContext, StepOutput
@@ -309,3 +312,123 @@ class ConfidenceThresholdProbe(QualityProbe):
             )
 
         return result
+
+
+class ConvergenceCriteriaProbe(QualityProbe):
+    """Checks structured ConvergenceCriterion declarations from DesiredState.
+
+    Iterates desired_state.convergence_criteria and checks each one.
+    All criteria must pass for should_converge=True.
+
+    Supported criterion_type values:
+        - "file_exists": checks if params["path"] file exists on disk
+        - "all_tests_pass": runs params.get("test_command", "pytest") as subprocess
+        - "lint_clean": runs params.get("lint_command", "ruff check .") as subprocess
+        - "custom_probe": always passes (checked externally)
+
+    Args:
+        run_shell_commands: Whether to actually run shell commands for
+            all_tests_pass/lint_clean checks (default False for safety in tests).
+    """
+
+    def __init__(self, run_shell_commands: bool = False) -> None:
+        self._run_shell_commands = run_shell_commands
+
+    @property
+    def name(self) -> str:
+        """Name of this probe."""
+        return "ConvergenceCriteriaProbe"
+
+    async def evaluate(
+        self,
+        step_output: StepOutput,
+        context: LoopContext,
+    ) -> ProbeResult:
+        """Evaluate convergence criteria from DesiredState.
+
+        Args:
+            step_output: The output from the current reconcile step.
+            context: Full context of the reconcile loop.
+
+        Returns:
+            ProbeResult indicating whether all criteria are satisfied.
+        """
+        criteria = context.desired_state.convergence_criteria
+        if not criteria:
+            # No criteria declared -> always pass, never auto-converge
+            return ProbeResult(
+                verdict="passed",
+                confidence=0.8,
+                reason="No convergence criteria declared",
+                should_converge=False,
+            )
+
+        failed_criteria: list[str] = []
+        for criterion in criteria:
+            passed = await self._check_criterion(criterion)
+            if not passed:
+                failed_criteria.append(criterion.description or criterion.criterion_type)
+
+        if not failed_criteria:
+            return ProbeResult(
+                verdict="passed",
+                confidence=0.95,
+                reason=f"All {len(criteria)} convergence criteria satisfied",
+                should_converge=True,
+            )
+
+        return ProbeResult(
+            verdict="soft_fail",
+            confidence=0.5,
+            reason=f"Criteria not yet met: {', '.join(failed_criteria)}",
+            should_converge=False,
+            suggestions=[f"Work on: {c}" for c in failed_criteria],
+        )
+
+    async def _check_criterion(self, criterion: ConvergenceCriterion) -> bool:
+        """Check a single criterion.
+
+        Args:
+            criterion: The criterion to check.
+
+        Returns:
+            True if the criterion is satisfied.
+        """
+        import os
+
+        if criterion.criterion_type == "file_exists":
+            path = criterion.params.get("path", "")
+            return bool(path) and os.path.exists(path)
+
+        if criterion.criterion_type == "custom_probe":
+            return True
+
+        if not self._run_shell_commands:
+            return False  # Conservative: report not-yet-met without running
+
+        if criterion.criterion_type == "all_tests_pass":
+            cmd = criterion.params.get("test_command", "pytest")
+            return await self._run_command(cmd)
+
+        if criterion.criterion_type == "lint_clean":
+            cmd = criterion.params.get("lint_command", "ruff check .")
+            return await self._run_command(cmd)
+
+        return False
+
+    async def _run_command(self, cmd: str) -> bool:
+        """Run a shell command, return True if exit code 0.
+
+        Args:
+            cmd: Shell command to execute.
+
+        Returns:
+            True if the command exited with code 0.
+        """
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        return proc.returncode == 0
