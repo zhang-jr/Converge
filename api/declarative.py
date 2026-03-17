@@ -9,9 +9,11 @@ from __future__ import annotations
 from typing import Any
 
 from core.runtime.agent_runtime import AgentRuntime
-from core.state.models import AgentConfig, DesiredState, ReconcileResult
+from core.state.models import AgentConfig, ConvergenceCriterion, DesiredState, ReconcileResult
 from core.state.sqlite_store import SQLiteStateStore
 from probes.quality_probe import DefaultQualityProbe, QualityProbe
+from skills.base import SkillBase
+from skills.registry import SkillRegistry
 from tools.base import ToolBase
 from tools.registry import ToolRegistry
 
@@ -47,6 +49,8 @@ class AgentFramework:
         self._quality_probe = quality_probe or DefaultQualityProbe()
         self._runtime: AgentRuntime | None = None
         self._default_config: AgentConfig | None = None
+        self._skill_registry: SkillRegistry = SkillRegistry()
+        self._loaded_skills: list[SkillBase] = []
 
     def register_tool(self, tool: ToolBase) -> AgentFramework:
         """Register a tool for agents to use.
@@ -58,6 +62,40 @@ class AgentFramework:
             Self for method chaining.
         """
         self._tool_registry.register(tool)
+        return self
+
+    def load_skill(self, skill: str | SkillBase) -> AgentFramework:
+        """Load a skill into the framework, registering its tools.
+
+        When a skill is loaded:
+        1. All skill tools are registered in the ToolRegistry.
+        2. The skill's ``system_prompt_addon`` is appended to the agent's
+           system prompt on the next ``run()`` call.
+        3. The skill's ``convergence_criteria`` are merged into the
+           DesiredState on the next ``run()`` call.
+
+        Args:
+            skill: A :class:`~skills.base.SkillBase` instance, or the name
+                of a skill previously registered via
+                ``framework._skill_registry.register()``.
+
+        Returns:
+            Self for method chaining.
+
+        Raises:
+            KeyError: If ``skill`` is a string and not found in the registry.
+
+        Example::
+
+            from skills.builtin.code_review import create_code_review_skill
+            framework.load_skill(create_code_review_skill())
+            result = await framework.run("Review the auth module")
+        """
+        if isinstance(skill, str):
+            skill = self._skill_registry.get(skill)
+
+        self.register_tools(skill.tools)
+        self._loaded_skills.append(skill)
         return self
 
     def register_tools(self, tools: list[ToolBase]) -> AgentFramework:
@@ -132,6 +170,10 @@ class AgentFramework:
         """
         config = agent_config or self._default_config
 
+        # Merge loaded-skill system prompt addons and convergence criteria.
+        config = self._apply_skills_to_config(config)
+        extra_criteria = self._collect_skill_criteria()
+
         state_store = SQLiteStateStore(self._db_path)
         runtime = AgentRuntime(
             state_store=state_store,
@@ -139,13 +181,62 @@ class AgentFramework:
             quality_probe=self._quality_probe,
         )
 
+        desired_state = DesiredState(
+            goal=goal,
+            constraints=constraints or [],
+            context=context or {},
+            convergence_criteria=extra_criteria,
+        )
+
         async with runtime:
-            return await runtime.run(
-                goal=goal,
-                agent_config=config,
-                constraints=constraints,
-                context=context,
+            from core.agent.agent import Agent
+
+            agent = Agent(
+                config=config,
+                state_store=state_store,
+                tool_registry=self._tool_registry,
+                quality_probe=self._quality_probe,
             )
+            return await agent.run(desired_state)
+
+    # ------------------------------------------------------------------
+    # Skill helpers (private)
+    # ------------------------------------------------------------------
+
+    def _apply_skills_to_config(
+        self,
+        config: AgentConfig | None,
+    ) -> AgentConfig | None:
+        """Return a new AgentConfig with skill system_prompt_addons merged in."""
+        if not self._loaded_skills:
+            return config
+
+        addons = [s.system_prompt_addon for s in self._loaded_skills if s.system_prompt_addon]
+        if not addons:
+            return config
+
+        addon_text = "\n\n".join(addons)
+
+        if config is None:
+            config = AgentConfig(
+                agent_id="default-agent",
+                system_prompt=addon_text,
+            )
+        else:
+            base_prompt = config.system_prompt or ""
+            separator = "\n\n" if base_prompt else ""
+            config = config.model_copy(
+                update={"system_prompt": base_prompt + separator + addon_text}
+            )
+
+        return config
+
+    def _collect_skill_criteria(self) -> list[ConvergenceCriterion]:
+        """Collect convergence criteria from all loaded skills."""
+        criteria: list[ConvergenceCriterion] = []
+        for skill in self._loaded_skills:
+            criteria.extend(skill.convergence_criteria)
+        return criteria
 
     def run_sync(
         self,
