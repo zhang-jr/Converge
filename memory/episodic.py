@@ -317,3 +317,333 @@ class EpisodicMemory:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+# =============================================================================
+# Vector backend
+# =============================================================================
+
+
+class VectorEpisodicMemory:
+    """Episodic memory using ChromaDB for semantic (embedding-based) search.
+
+    Provides the same interface as :class:`EpisodicMemory` so callers can
+    switch backends without code changes.  Requires the ``[vector]``
+    optional dependency group::
+
+        pip install agent-framework[vector]
+
+    Usage::
+
+        memory = VectorEpisodicMemory()   # in-process ephemeral
+        await memory.initialize()
+
+        ep_id = await memory.store(
+            agent_id="analyst",
+            task_summary="Reviewed auth module for SQL injection",
+            outcome="Found 1 critical issue in login.py",
+            context_tags=["security", "sql"],
+        )
+
+        results = await memory.search("SQL injection auth")
+        # Returns semantically similar episodes, not just substring matches.
+    """
+
+    def __init__(
+        self,
+        path: str = ":memory:",
+        collection_name: str = "episodes",
+    ) -> None:
+        """Initialize vector episodic memory.
+
+        Args:
+            path: Storage path.  Use ``":memory:"`` for an ephemeral in-process
+                store; provide a file-system path for persistence.
+            collection_name: ChromaDB collection name.
+        """
+        self._path = path
+        self._collection_name = collection_name
+        self._client: Any = None
+        self._collection: Any = None
+
+    async def initialize(self) -> None:
+        """Create the ChromaDB client and collection. Must be called before use.
+
+        Raises:
+            ImportError: If ``chromadb`` is not installed.
+        """
+        await asyncio.to_thread(self._init_chromadb)
+
+    def _init_chromadb(self) -> None:
+        """Create chromadb client and get/create collection (sync)."""
+        try:
+            import chromadb
+        except ImportError as exc:
+            raise ImportError(
+                "chromadb is required for VectorEpisodicMemory. "
+                "Install with: pip install agent-framework[vector]"
+            ) from exc
+
+        if self._path == ":memory:":
+            self._client = chromadb.EphemeralClient()
+        else:
+            self._client = chromadb.PersistentClient(path=self._path)
+
+        self._collection = self._client.get_or_create_collection(
+            name=self._collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    async def store(
+        self,
+        agent_id: str,
+        task_summary: str,
+        outcome: str,
+        context_tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Store a new episodic memory and return its episode_id.
+
+        Args:
+            agent_id: ID of the agent whose experience this is.
+            task_summary: What the task was about.
+            outcome: What happened / what the result was.
+            context_tags: Tags for categorization and filtering.
+            metadata: Additional structured data.
+
+        Returns:
+            episode_id of the stored episode.
+        """
+        episode = Episode(
+            agent_id=agent_id,
+            task_summary=task_summary,
+            outcome=outcome,
+            context_tags=context_tags or [],
+            metadata=metadata or {},
+        )
+        await asyncio.to_thread(self._add_episode, episode)
+        return episode.episode_id
+
+    def _add_episode(self, episode: Episode) -> None:
+        """Insert episode into ChromaDB collection (sync)."""
+        import json
+
+        self._collection.add(
+            ids=[episode.episode_id],
+            documents=[episode.to_search_text()],
+            metadatas=[{
+                "agent_id": episode.agent_id,
+                "task_summary": episode.task_summary,
+                "outcome": episode.outcome,
+                "context_tags_json": json.dumps(episode.context_tags),
+                "metadata_json": json.dumps(episode.metadata),
+                "created_at": episode.created_at.isoformat(),
+                "created_at_ts": episode.created_at.timestamp(),
+            }],
+        )
+
+    async def store_eviction(
+        self,
+        evicted_content: str,
+        role: str,
+        step: int,
+    ) -> None:
+        """Store a context-window eviction fragment as an episodic memory.
+
+        Args:
+            evicted_content: The content of the evicted message.
+            role: The role of the evicted message (user/assistant/tool).
+            step: The reconcile loop step number of the evicted message.
+        """
+        await self.store(
+            agent_id="context_manager",
+            task_summary=f"Evicted {role} message from step {step}",
+            outcome=evicted_content[:500],
+            context_tags=["eviction", role],
+            metadata={"step_number": step, "full_content": evicted_content},
+        )
+
+    # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
+
+    async def search(
+        self,
+        query: str,
+        agent_id: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[Episode]:
+        """Search episodic memory using vector similarity.
+
+        An empty query falls back to :meth:`list_recent` (no meaningful
+        embedding can be produced from an empty string).
+
+        Args:
+            query: Natural-language query for semantic similarity search.
+            agent_id: Optional filter by agent.
+            tags: Optional post-filter by tags (any match).
+            limit: Maximum results to return.
+
+        Returns:
+            List of matching episodes, most similar first.
+        """
+        if not query:
+            return await self.list_recent(agent_id=agent_id, limit=limit)
+        return await asyncio.to_thread(self._query_sync, query, agent_id, tags, limit)
+
+    def _query_sync(
+        self,
+        query: str,
+        agent_id: str | None,
+        tags: list[str] | None,
+        limit: int,
+    ) -> list[Episode]:
+        """ChromaDB vector query (sync)."""
+        where: dict[str, Any] = {}
+        if agent_id:
+            where["agent_id"] = {"$eq": agent_id}
+
+        kwargs: dict[str, Any] = {
+            "query_texts": [query],
+            # Over-fetch so tag post-filter still returns up to `limit`.
+            "n_results": min(limit * 3, 100),
+        }
+        if where:
+            kwargs["where"] = where
+
+        try:
+            results = self._collection.query(**kwargs)
+        except Exception:
+            return []
+
+        ids: list[str] = results.get("ids", [[]])[0]
+        metadatas: list[dict[str, Any]] = results.get("metadatas", [[]])[0]
+
+        episodes = [
+            self._meta_to_episode(ep_id, meta)
+            for ep_id, meta in zip(ids, metadatas)
+        ]
+
+        if tags:
+            episodes = [e for e in episodes if any(t in e.context_tags for t in tags)]
+
+        return episodes[:limit]
+
+    def _meta_to_episode(self, episode_id: str, meta: dict[str, Any]) -> Episode:
+        """Reconstruct an Episode from ChromaDB metadata."""
+        import json
+
+        return Episode(
+            episode_id=episode_id,
+            agent_id=meta["agent_id"],
+            task_summary=meta["task_summary"],
+            outcome=meta["outcome"],
+            context_tags=json.loads(meta.get("context_tags_json", "[]")),
+            metadata=json.loads(meta.get("metadata_json", "{}")),
+            created_at=datetime.fromisoformat(meta["created_at"]),
+        )
+
+    async def get(self, episode_id: str) -> Episode | None:
+        """Retrieve a specific episode by ID.
+
+        Args:
+            episode_id: The episode identifier.
+
+        Returns:
+            Episode if found, None otherwise.
+        """
+        return await asyncio.to_thread(self._get_sync, episode_id)
+
+    def _get_sync(self, episode_id: str) -> Episode | None:
+        """Sync get by ID."""
+        try:
+            result = self._collection.get(ids=[episode_id])
+        except Exception:
+            return None
+
+        ids: list[str] = result.get("ids", [])
+        metadatas: list[dict[str, Any]] = result.get("metadatas", [])
+
+        if not ids:
+            return None
+
+        return self._meta_to_episode(ids[0], metadatas[0])
+
+    async def list_recent(
+        self,
+        agent_id: str | None = None,
+        limit: int = 20,
+    ) -> list[Episode]:
+        """List most recent episodes, sorted by creation time.
+
+        Args:
+            agent_id: Optional filter by agent.
+            limit: Maximum number of results.
+
+        Returns:
+            List of recent episodes, most recent first.
+        """
+        return await asyncio.to_thread(self._list_recent_sync, agent_id, limit)
+
+    def _list_recent_sync(
+        self,
+        agent_id: str | None,
+        limit: int,
+    ) -> list[Episode]:
+        """Sync list_recent: get all (optionally filtered) and sort by time."""
+        kwargs: dict[str, Any] = {}
+        if agent_id:
+            kwargs["where"] = {"agent_id": {"$eq": agent_id}}
+
+        try:
+            result = self._collection.get(**kwargs)
+        except Exception:
+            return []
+
+        ids: list[str] = result.get("ids", [])
+        metadatas: list[dict[str, Any]] = result.get("metadatas", []) or []
+
+        episodes = [
+            self._meta_to_episode(ep_id, meta)
+            for ep_id, meta in zip(ids, metadatas)
+        ]
+
+        # Sort by created_at timestamp descending (newest first).
+        episodes.sort(key=lambda e: e.created_at.timestamp(), reverse=True)
+
+        return episodes[:limit]
+
+    async def delete(self, episode_id: str) -> bool:
+        """Delete an episode by ID.
+
+        Args:
+            episode_id: The episode to delete.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        return await asyncio.to_thread(self._delete_sync, episode_id)
+
+    def _delete_sync(self, episode_id: str) -> bool:
+        """Sync delete by ID."""
+        try:
+            result = self._collection.get(ids=[episode_id])
+        except Exception:
+            return False
+
+        if not result.get("ids"):
+            return False
+
+        self._collection.delete(ids=[episode_id])
+        return True
+
+    async def close(self) -> None:
+        """Release ChromaDB client resources."""
+        # EphemeralClient has no explicit close; set to None for GC.
+        self._client = None
+        self._collection = None

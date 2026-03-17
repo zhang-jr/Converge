@@ -40,6 +40,9 @@ otel = [
 postgres = [
     "asyncpg>=0.29",
 ]
+vector = [
+    "chromadb>=0.4.0",
+]
 
 [build-system]
 requires = ["hatchling"]

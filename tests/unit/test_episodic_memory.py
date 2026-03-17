@@ -261,6 +261,123 @@ class TestStoreEviction:
 
 
 # =============================================================================
+# VectorEpisodicMemory (requires chromadb — skipped if not installed)
+# =============================================================================
+
+
+@pytest.fixture
+async def vector_memory():
+    """Fresh VectorEpisodicMemory with in-process ChromaDB (if available)."""
+    pytest.importorskip("chromadb", reason="chromadb not installed; skipping vector tests")
+    from memory.episodic import VectorEpisodicMemory
+
+    mem = VectorEpisodicMemory(":memory:")
+    await mem.initialize()
+    yield mem
+    await mem.close()
+
+
+class TestVectorEpisodicMemoryStore:
+    """Tests that VectorEpisodicMemory satisfies the same contract as EpisodicMemory."""
+
+    async def test_store_returns_episode_id(self, vector_memory):
+        """store() returns a non-empty episode_id."""
+        ep_id = await vector_memory.store(
+            agent_id="agent-v",
+            task_summary="Reviewed auth module",
+            outcome="Found SQL injection",
+        )
+        assert isinstance(ep_id, str) and len(ep_id) > 0
+
+    async def test_get_retrieves_stored_episode(self, vector_memory):
+        """get() retrieves the episode stored via store()."""
+        ep_id = await vector_memory.store(
+            agent_id="agent-v",
+            task_summary="Reviewed auth module",
+            outcome="Found SQL injection",
+            context_tags=["security", "sql"],
+        )
+        episode = await vector_memory.get(ep_id)
+        assert episode is not None
+        assert episode.episode_id == ep_id
+        assert episode.agent_id == "agent-v"
+        assert "security" in episode.context_tags
+
+    async def test_get_missing_returns_none(self, vector_memory):
+        """get() returns None for an unknown ID."""
+        assert await vector_memory.get("no-such-id") is None
+
+    async def test_store_with_metadata(self, vector_memory):
+        """Metadata round-trips correctly through ChromaDB."""
+        ep_id = await vector_memory.store(
+            agent_id="a",
+            task_summary="Performance test",
+            outcome="95ms p99",
+            metadata={"tokens": 42, "model": "test"},
+        )
+        episode = await vector_memory.get(ep_id)
+        assert episode is not None
+        assert episode.metadata["tokens"] == 42
+
+    async def test_delete_existing_episode(self, vector_memory):
+        """delete() returns True and removes the episode."""
+        ep_id = await vector_memory.store("a", "Task", "Result")
+        assert await vector_memory.delete(ep_id) is True
+        assert await vector_memory.get(ep_id) is None
+
+    async def test_delete_missing_returns_false(self, vector_memory):
+        """delete() returns False for unknown IDs."""
+        assert await vector_memory.delete("no-such-id") is False
+
+    async def test_semantic_search_returns_relevant_results(self, vector_memory):
+        """search() returns semantically related episodes."""
+        await vector_memory.store("a", "Security audit of login module", "Found XSS")
+        await vector_memory.store("a", "Performance test of payment service", "Slow query found")
+
+        results = await vector_memory.search("security vulnerability", limit=5)
+        assert len(results) >= 1
+        # The security episode should rank higher than performance
+        assert any("Security" in r.task_summary or "XSS" in r.outcome for r in results)
+
+    async def test_empty_query_falls_back_to_list_recent(self, vector_memory):
+        """Empty query returns recent episodes without error."""
+        await vector_memory.store("a", "Task 1", "Result 1")
+        await vector_memory.store("a", "Task 2", "Result 2")
+
+        results = await vector_memory.search("", limit=10)
+        assert len(results) == 2
+
+    async def test_list_recent_newest_first(self, vector_memory):
+        """list_recent() returns episodes sorted newest-first."""
+        await vector_memory.store("a", "Old task", "Old result")
+        await asyncio.sleep(0.05)
+        await vector_memory.store("a", "New task", "New result")
+
+        recent = await vector_memory.list_recent(limit=10)
+        assert len(recent) == 2
+        assert recent[0].task_summary == "New task"
+
+    async def test_list_recent_agent_filter(self, vector_memory):
+        """list_recent() respects agent_id filter."""
+        await vector_memory.store("agent-1", "Task by 1", "Done")
+        await vector_memory.store("agent-2", "Task by 2", "Done")
+
+        recent = await vector_memory.list_recent(agent_id="agent-1")
+        assert all(r.agent_id == "agent-1" for r in recent)
+
+    async def test_store_eviction_works(self, vector_memory):
+        """store_eviction() stores an episode tagged 'eviction'."""
+        await vector_memory.store_eviction(
+            evicted_content="Some context was evicted",
+            role="user",
+            step=3,
+        )
+        results = await vector_memory.list_recent(agent_id="context_manager")
+        assert len(results) == 1
+        assert "eviction" in results[0].context_tags
+
+
+# =============================================================================
 # Episode Model
 # =============================================================================
 
