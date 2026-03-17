@@ -24,6 +24,7 @@ from core.state.models import (
     StepOutput,
     ToolCall,
 )
+from memory.scratchpad import AgentScratchpad
 from observability.tracer import Tracer
 from probes.quality_probe import DefaultQualityProbe, QualityProbe
 
@@ -152,6 +153,7 @@ class Agent:
         self._tracer = tracer or Tracer(agent_id=config.agent_id)
         self._human_intervention_handler = human_intervention_handler
         self._llm_client: Any = None
+        self._scratchpad: AgentScratchpad = AgentScratchpad()
 
     @property
     def config(self) -> AgentConfig:
@@ -162,6 +164,11 @@ class Agent:
     def agent_id(self) -> str:
         """Get agent ID."""
         return self._config.agent_id
+
+    @property
+    def scratchpad(self) -> AgentScratchpad:
+        """Per-run scratchpad for ephemeral notes. Cleared on each run()."""
+        return self._scratchpad
 
     async def run(self, desired_state: DesiredState) -> ReconcileResult:
         """Run the agent to achieve the desired state.
@@ -174,6 +181,9 @@ class Agent:
         """
         if self._state_store is None:
             raise RuntimeError("Agent requires a StateStore")
+
+        # Reset scratchpad so each run starts with a clean slate.
+        self._scratchpad.clear()
 
         loop = AgentReconcileLoop(
             agent=self,
@@ -261,7 +271,14 @@ class Agent:
                     history_items.append(f"  Result: {step.result}")
             history_text = "\n\nRecent history:\n" + "\n".join(history_items)
 
-        user_message = f"Goal: {goal}{constraint_text}{history_text}"
+        scratchpad_text = ""
+        if len(self._scratchpad) > 0:
+            notes = "\n".join(
+                f"  {k}: {v}" for k, v in self._scratchpad.to_dict().items()
+            )
+            scratchpad_text = f"\n\nScratchpad (your notes from this run):\n{notes}"
+
+        user_message = f"Goal: {goal}{constraint_text}{history_text}{scratchpad_text}"
 
         return [
             {"role": "system", "content": system_prompt},
