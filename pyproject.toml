@@ -43,6 +43,16 @@ postgres = [
 vector = [
     "chromadb>=0.4.0",
 ]
+docker = [
+    # No Python package required — uses Docker CLI via subprocess.
+    # Ensure Docker daemon is running and `docker` is on PATH.
+]
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "httpx>=0.27.0",
+    "websockets>=12.0",
+]
 
 [build-system]
 requires = ["hatchling"]
