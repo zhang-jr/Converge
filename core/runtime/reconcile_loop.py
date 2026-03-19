@@ -10,6 +10,7 @@ import asyncio
 import time
 import uuid
 from abc import ABC
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from core.state.models import (
@@ -27,6 +28,7 @@ from errors.exceptions import (
     HumanInterventionRequired,
     LoopDetectedError,
     QualityProbeFailure,
+    RollbackError,
 )
 from observability.tracer import Tracer
 from probes.quality_probe import DefaultQualityProbe, ProbeResult, QualityProbe
@@ -65,6 +67,14 @@ class ReconcileLoop(ABC):
         confidence_threshold: Minimum confidence for auto-proceed.
         retry_on_conflict: Whether to retry on version conflicts.
         max_conflict_retries: Maximum retries on version conflict.
+        step_callback: Optional async callable invoked after each completed step.
+            Signature: ``async def callback(step: StepOutput) -> None``.
+            Useful for streaming step events to external consumers (e.g. API server).
+        enable_rollback: If True, a StateStore snapshot is taken before each
+            ``_act`` call.  On unrecoverable failure the loop attempts to
+            restore state to the pre-act snapshot via :meth:`StateStore.restore`.
+            Requires the StateStore implementation to support snapshots
+            (e.g. SQLiteStateStore).  Silently skips if not supported.
     """
 
     def __init__(
@@ -81,6 +91,8 @@ class ReconcileLoop(ABC):
         human_intervention_handler: HumanInterventionHandler | None = None,
         enable_planning: bool = False,
         planning_mode: bool = False,
+        step_callback: Callable[[StepOutput], Awaitable[None]] | None = None,
+        enable_rollback: bool = False,
     ) -> None:
         self._state_store = state_store
         self._tool_registry = tool_registry
@@ -94,6 +106,8 @@ class ReconcileLoop(ABC):
         self._human_intervention_handler = human_intervention_handler
         self._enable_planning = enable_planning
         self._planning_mode = planning_mode
+        self._step_callback = step_callback
+        self._enable_rollback = enable_rollback
 
     async def _planning_phase(
         self,
@@ -203,6 +217,9 @@ class ReconcileLoop(ABC):
             else:
                 error_message = "Planning mode enabled but _planning_phase returned None"
         else:
+            # Track the most recent pre-act snapshot for rollback
+            _last_snapshot_id: str | None = None
+
             try:
                 for step_num in range(1, self._safety_max_steps + 1):
                     context.current_step = step_num
@@ -214,6 +231,13 @@ class ReconcileLoop(ABC):
                     if not diff:
                         final_status = "converged"
                         break
+
+                    # Take a snapshot before acting (rollback support)
+                    if self._enable_rollback:
+                        try:
+                            _last_snapshot_id = await self._state_store.snapshot()
+                        except NotImplementedError:
+                            pass  # StateStore doesn't support snapshots — skip silently
 
                     step_output = await self._act(diff, context)
                     step_output.step_number = step_num
@@ -258,6 +282,13 @@ class ReconcileLoop(ABC):
 
                     await self.on_step_complete(step_output)
 
+                    # Notify external consumer (e.g. API server WebSocket stream)
+                    if self._step_callback is not None:
+                        try:
+                            await self._step_callback(step_output)
+                        except Exception:
+                            pass  # Never let callback failure interrupt the loop
+
                     if probe_result.should_converge:
                         final_status = "converged"
                         break
@@ -273,17 +304,20 @@ class ReconcileLoop(ABC):
             except ConvergenceTimeoutError:
                 final_status = "timeout"
                 error_message = f"Exceeded {self._safety_max_steps} steps"
+                await self._attempt_rollback(_last_snapshot_id, len(steps))
                 raise
 
             except LoopDetectedError as e:
                 final_status = "failed"
                 error_message = str(e)
+                await self._attempt_rollback(_last_snapshot_id, len(steps))
                 await self.on_failure(e, len(steps))
                 raise
 
             except QualityProbeFailure as e:
                 final_status = "failed"
                 error_message = e.probe_reason
+                await self._attempt_rollback(_last_snapshot_id, len(steps))
                 await self.on_failure(e, len(steps))
                 raise
 
@@ -294,6 +328,7 @@ class ReconcileLoop(ABC):
                 final_status = "failed"
                 error_message = str(e)
                 self._tracer.log_error(e)
+                await self._attempt_rollback(_last_snapshot_id, len(steps))
                 await self.on_failure(e, len(steps))
                 raise
 
@@ -317,6 +352,33 @@ class ReconcileLoop(ABC):
         self._tracer.end_trace(final_status)
 
         return result
+
+    async def _attempt_rollback(
+        self,
+        snapshot_id: str | None,
+        steps_completed: int,
+    ) -> None:
+        """Attempt to restore state to the last pre-act snapshot.
+
+        Silently skips if rollback is disabled, snapshot_id is None,
+        or the StateStore doesn't support snapshots.
+
+        Args:
+            snapshot_id: The snapshot ID to restore, or None.
+            steps_completed: Used only for logging context.
+        """
+        if not self._enable_rollback or snapshot_id is None:
+            return
+        try:
+            await self._state_store.restore(snapshot_id)
+            self._tracer.log_state_change(
+                key="__rollback__",
+                old_value=None,
+                new_value={"snapshot_id": snapshot_id, "steps_completed": steps_completed},
+                change_type="updated",
+            )
+        except (NotImplementedError, RollbackError) as e:
+            self._tracer.log_error(e)
 
     async def _get_state_snapshot(self) -> dict[str, Any]:
         """Get current state snapshot."""

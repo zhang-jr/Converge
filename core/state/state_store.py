@@ -103,6 +103,56 @@ class StateStore(ABC):
         """Close the state store and release resources."""
         ...
 
+    async def snapshot(self, prefix: str = "") -> str:
+        """Create a point-in-time snapshot of state entries matching prefix.
+
+        The snapshot captures all entries whose keys start with ``prefix``.
+        An empty prefix snapshots the entire store.
+
+        Args:
+            prefix: Key prefix to filter entries.  Empty = all keys.
+
+        Returns:
+            A unique snapshot ID that can be passed to :meth:`restore`.
+
+        Raises:
+            NotImplementedError: If this implementation does not support snapshots.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support snapshot/restore"
+        )
+
+    async def restore(self, snapshot_id: str) -> None:
+        """Restore state to a previously captured snapshot.
+
+        All state entries covered by the snapshot's prefix are replaced
+        with their snapshotted values.  Entries added after the snapshot
+        (within the same prefix scope) are deleted.
+
+        Args:
+            snapshot_id: A snapshot ID previously returned by :meth:`snapshot`.
+
+        Raises:
+            NotImplementedError: If this implementation does not support snapshots.
+            KeyError: If snapshot_id does not exist.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support snapshot/restore"
+        )
+
+    async def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot to free storage.
+
+        Args:
+            snapshot_id: A snapshot ID previously returned by :meth:`snapshot`.
+
+        Raises:
+            NotImplementedError: If this implementation does not support snapshots.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support snapshot/restore"
+        )
+
     async def __aenter__(self) -> StateStore:
         """Async context manager entry."""
         return self

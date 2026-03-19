@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from core.runtime.reconcile_loop import ReconcileLoop
@@ -49,6 +50,8 @@ class AgentReconcileLoop(ReconcileLoop):
         quality_probe: QualityProbe | None = None,
         tracer: Tracer | None = None,
         human_intervention_handler: HumanInterventionHandler | None = None,
+        step_callback: Callable[[StepOutput], Awaitable[None]] | None = None,
+        enable_rollback: bool = False,
     ) -> None:
         super().__init__(
             state_store=state_store,
@@ -59,6 +62,8 @@ class AgentReconcileLoop(ReconcileLoop):
             confidence_threshold=agent.config.confidence_threshold,
             agent_id=agent.config.agent_id,
             human_intervention_handler=human_intervention_handler,
+            step_callback=step_callback,
+            enable_rollback=enable_rollback,
         )
         self._agent = agent
 
@@ -170,11 +175,22 @@ class Agent:
         """Per-run scratchpad for ephemeral notes. Cleared on each run()."""
         return self._scratchpad
 
-    async def run(self, desired_state: DesiredState) -> ReconcileResult:
+    async def run(
+        self,
+        desired_state: DesiredState,
+        step_callback: Callable[[StepOutput], Awaitable[None]] | None = None,
+        enable_rollback: bool = False,
+    ) -> ReconcileResult:
         """Run the agent to achieve the desired state.
 
         Args:
             desired_state: The goal to achieve.
+            step_callback: Optional async callable invoked after each completed
+                step.  Signature: ``async def cb(step: StepOutput) -> None``.
+                Useful for streaming step events to external consumers.
+            enable_rollback: If True, take a StateStore snapshot before each
+                act step and restore on failure (requires SQLiteStateStore or
+                another snapshot-capable implementation).
 
         Returns:
             ReconcileResult with execution details.
@@ -192,6 +208,8 @@ class Agent:
             quality_probe=self._quality_probe,
             tracer=self._tracer,
             human_intervention_handler=self._human_intervention_handler,
+            step_callback=step_callback,
+            enable_rollback=enable_rollback,
         )
 
         return await loop.run(desired_state)
