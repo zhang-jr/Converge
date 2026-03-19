@@ -8,20 +8,31 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from core.config import BASH_TOOL_DEFAULT_TIMEOUT
 from tools.base import ToolBase, ToolDryRunResult, ToolResult
+
+if TYPE_CHECKING:
+    from tools.sandbox.base import SandboxBase
 
 # Process registry for KillShellTool: pid -> asyncio.subprocess.Process
 _active_processes: dict[int, asyncio.subprocess.Process] = {}
 
 
 class BashTool(ToolBase):
-    """Execute a shell command in a subprocess.
+    """Execute a shell command in a subprocess or sandbox.
 
     HIGH RISK: Can run arbitrary commands. Always triggers human-in-the-loop.
+
+    Args:
+        sandbox: Optional SandboxBase instance.  When provided, all commands
+            are routed through the sandbox instead of direct subprocess execution.
+            Recommended for production use (SubprocessSandbox or DockerSandbox).
     """
+
+    def __init__(self, sandbox: SandboxBase | None = None) -> None:
+        self._sandbox = sandbox
 
     @property
     def name(self) -> str:
@@ -94,7 +105,7 @@ class BashTool(ToolBase):
         )
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Execute a shell command.
+        """Execute a shell command, optionally via sandbox.
 
         Args:
             params: Must contain 'command'; optionally 'timeout', 'cwd', 'env'.
@@ -110,6 +121,48 @@ class BashTool(ToolBase):
         if not command:
             return ToolResult(success=False, error="'command' parameter is required")
 
+        # Sandbox path — delegate entirely to the sandbox implementation
+        if self._sandbox is not None:
+            from tools.sandbox.base import ResourceLimits
+            try:
+                result = await self._sandbox.run(
+                    command,
+                    env=extra_env or None,
+                    cwd=cwd,
+                    timeout=float(timeout),
+                    resource_limits=ResourceLimits(),
+                )
+            except Exception as e:
+                return ToolResult(
+                    success=False,
+                    error=f"Sandbox error: {e}",
+                    metadata={"command": command, "sandbox": self._sandbox.sandbox_type},
+                )
+
+            success = result.returncode == 0
+            error_msg: str | None = None
+            if result.timed_out:
+                error_msg = f"Command timed out after {timeout}s: {command!r}"
+                success = False
+            elif not success:
+                error_msg = (
+                    f"Command exited with code {result.returncode}: {result.stderr[:500]}"
+                )
+
+            return ToolResult(
+                success=success,
+                output={"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode},
+                error=error_msg,
+                metadata={
+                    "command": command,
+                    "returncode": result.returncode,
+                    "sandbox": self._sandbox.sandbox_type,
+                    "timed_out": result.timed_out,
+                    "resource_exceeded": result.resource_exceeded,
+                },
+            )
+
+        # Direct subprocess path (no sandbox)
         env = {**os.environ, **extra_env} if extra_env else None
 
         try:

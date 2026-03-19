@@ -412,6 +412,60 @@ class WorkflowCycleError(WorkflowError):
         self.cycle_path = cycle_path
 
 
+class SandboxError(AgentFrameworkError):
+    """Raised when sandbox execution encounters an error.
+
+    Args:
+        message: Human-readable error description.
+        sandbox_type: The type of sandbox that failed.
+        cmd: The command that was attempted.
+        context: Additional context information.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_type: str,
+        cmd: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        ctx = context or {}
+        ctx["sandbox_type"] = sandbox_type
+        if cmd:
+            ctx["cmd"] = cmd
+        super().__init__(message, context=ctx)
+        self.sandbox_type = sandbox_type
+        self.cmd = cmd
+
+
+class RollbackError(AgentFrameworkError):
+    """Raised when a state rollback operation fails.
+
+    Args:
+        message: Human-readable error description.
+        snapshot_id: The snapshot ID that failed to restore.
+        agent_id: ID of the agent that raised the error.
+        step: Current step number in the reconcile loop.
+        context: Additional context information.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        snapshot_id: str | None = None,
+        agent_id: str | None = None,
+        step: int | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        ctx = context or {}
+        if snapshot_id:
+            ctx["snapshot_id"] = snapshot_id
+        super().__init__(message, agent_id=agent_id, step=step, context=ctx)
+        self.snapshot_id = snapshot_id
+
+
 class QualityProbeFailure(AgentFrameworkError):
     """Raised when a quality probe fails with hard_fail verdict.
 
