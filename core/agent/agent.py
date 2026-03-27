@@ -340,21 +340,46 @@ Respond with:
         Returns:
             Response dict with choices, usage, and latency_ms.
         """
-        from core.config import LLM_API_BASE, LLM_MAX_TOKENS, LLM_MODEL, LLM_TEMPERATURE
+        from core.config import (
+            LLM_API_BASE,
+            LLM_API_KEY,
+            LLM_MAX_TOKENS,
+            LLM_MODEL,
+            LLM_TEMPERATURE,
+            resolve_model,
+        )
 
         tools_schema = self._build_tools_schema()
 
         try:
             import litellm
 
+            # Per-agent model override: resolve through provider registry so that
+            # baseUrl + apiKey are automatically picked up from llm_providers.json.
+            if self._config.model:
+                resolved = resolve_model(self._config.model)
+                model = resolved.litellm_model
+                api_base = resolved.api_base
+                api_key = resolved.api_key
+                max_tokens = resolved.max_tokens
+                temperature = resolved.temperature
+            else:
+                model = LLM_MODEL
+                api_base = LLM_API_BASE
+                api_key = LLM_API_KEY
+                max_tokens = LLM_MAX_TOKENS
+                temperature = LLM_TEMPERATURE
+
             kwargs: dict[str, Any] = {
-                "model": self._config.model or LLM_MODEL,
+                "model": model,
                 "messages": messages,
-                "max_tokens": LLM_MAX_TOKENS,
-                "temperature": LLM_TEMPERATURE,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
             }
-            if LLM_API_BASE:
-                kwargs["api_base"] = LLM_API_BASE
+            if api_base:
+                kwargs["api_base"] = api_base
+            if api_key:
+                kwargs["api_key"] = api_key
             if tools_schema:
                 kwargs["tools"] = tools_schema
 
