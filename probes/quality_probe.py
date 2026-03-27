@@ -174,12 +174,16 @@ class DefaultQualityProbe(QualityProbe):
         step_output: StepOutput,
         context: LoopContext,
     ) -> bool:
-        """Check if the goal appears to be achieved."""
-        result_str = str(step_output.result).lower() if step_output.result else ""
+        """Check if the goal appears to be achieved.
+
+        Only checks LLM-generated text (action/reasoning), not tool execution
+        result dicts which contain internal status fields like ``status: completed``
+        that are unrelated to goal completion.
+        """
         action_str = step_output.action.lower()
 
         for keyword in self._convergence_keywords:
-            if keyword in result_str or keyword in action_str:
+            if keyword in action_str:
                 return True
 
         return False

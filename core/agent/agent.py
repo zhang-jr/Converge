@@ -103,10 +103,14 @@ class AgentReconcileLoop(ReconcileLoop):
         last_step: dict[str, Any],
         desired: DesiredState,
     ) -> bool:
-        """Simple heuristic to check if goal might be achieved."""
-        result = str(last_step.get("result", "")).lower()
-        goal_keywords = ["completed", "done", "finished", "success"]
-        return any(kw in result for kw in goal_keywords)
+        """Simple heuristic to check if goal might be achieved.
+
+        Only checks action text (LLM output), not result dict (tool execution
+        status) to avoid false positives from fields like ``status: completed``.
+        """
+        action = str(last_step.get("action", "")).lower()
+        goal_keywords = ["completed", "done", "finished", "success", "achieved", "goal reached"]
+        return any(kw in action for kw in goal_keywords)
 
     async def _act(
         self,
