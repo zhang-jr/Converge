@@ -20,16 +20,19 @@ Built for engineers who need reliable, multi-agent systems they can trust in pro
 
 ## 设计理念
 
-| Kubernetes | Agent Framework | 说明 |
-|------------|-----------------|------|
-| Container  | `AgentCall`     | 单次 LLM 调用，无状态 |
-| Pod        | `Agent`         | AgentCall + Tools + Memory |
+| Kubernetes | Converge | 说明 |
+|------------|----------|------|
+| Container | `AgentCall` | 单次 LLM 调用，无状态 |
+| Pod | `Agent` | AgentCall + Tools + Memory 最小部署单元 |
 | Deployment | `AgentWorkflow` | 声明期望目标，框架负责收敛 |
-| kubelet    | `AgentRuntime`  | 本地执行引擎 |
+| Operator | `SpecialistAgent` | 领域专家模式 |
+| kubelet | `AgentRuntime` | 本地执行引擎 |
 | Control Loop | `ReconcileLoop` | observe → diff → act → verify → repeat |
-| etcd       | `StateStore`    | 单一事实来源 |
-| Scheduler  | `AgentScheduler` | 优先级任务调度 |
-| RBAC       | `AgentRBAC`     | Tool 权限管理 |
+| etcd | `StateStore` | 单一事实来源 |
+| Namespace | `AgentNamespace` | 多租户隔离 |
+| RBAC | `AgentRBAC` | Tool 权限管理 |
+| Health Probe | `QualityProbe` | 输出质量 / 置信度 / 循环检测 |
+| Scheduler | `AgentScheduler` | 优先级任务路由 |
 
 **核心原则：**
 - 声明式 API 优先 — 描述想要什么，框架负责怎么做
@@ -37,6 +40,7 @@ Built for engineers who need reliable, multi-agent systems they can trust in pro
 - 单一事实来源 — 所有状态只写 `StateStore`
 - Tool 副作用声明 — `risk_level` 自动插入 Human-in-the-loop
 - 可观测性不可选 — 每步产生结构化 Trace（含 trace_id、reasoning、tool I/O）
+- 失败时停下来 — 置信度低触发人工干预，循环检测立即中断
 
 ## 安装
 
@@ -49,15 +53,23 @@ pip install -e .
 可选依赖：
 
 ```bash
+# FastAPI HTTP / WebSocket API 服务器
+pip install -e ".[api]"
+
 # OpenTelemetry 支持（对接 Langfuse / Jaeger）
 pip install -e ".[otel]"
 
 # PostgreSQL StateStore（生产环境）
 pip install -e ".[postgres]"
 
+# 向量记忆（ChromaDB，语义搜索）
+pip install -e ".[vector]"
+
 # 开发工具（pytest、ruff、mypy）
 pip install -e ".[dev]"
 ```
+
+> `[docker]` 无需 Python 包，仅需本机安装 Docker CLI 即可使用 `DockerSandbox`。
 
 ## 快速开始
 
@@ -98,14 +110,14 @@ asyncio.run(main())
 ### 声明式 API
 
 ```python
-from api.declarative import agent, goal, run_agent
+from api.declarative import agent, run_agent
 
 result = await run_agent(
     "Analyze and summarize the data",
     agent_config=agent(
         "analyst",
         tools=["read_file", "search_code"],
-        model="anthropic/claude-3-5-sonnet-20241022",
+        model="anthropic/claude-opus-4-6",
         system_prompt="You are a data analysis expert.",
     ),
     constraints=["Only read, do not modify files"],
@@ -132,6 +144,83 @@ spec = WorkflowSpec(
 
 controller = WorkflowController(state_store=store, tool_registry=registry)
 result = await controller.run(spec)
+```
+
+### Skill 系统
+
+```python
+from api.declarative import AgentFramework
+from skills.builtin.code_review import create_code_review_skill
+
+framework = AgentFramework()
+framework.load_skill(create_code_review_skill())
+
+# Skill 自动注入工具 + system_prompt + 收敛判定标准
+result = await framework.run("Review the authentication module for security issues")
+```
+
+自定义 Skill：
+
+```python
+from skills.base import SkillBase
+
+class MySkill(SkillBase):
+    name = "my_skill"
+    description = "Domain-specific capability"
+    tools = [my_tool_instance]
+    system_prompt_addon = "You are an expert in..."
+    convergence_criteria = ["Issue list produced", "Severity ratings assigned"]
+```
+
+### 沙箱隔离
+
+```python
+from tools.sandbox.subprocess_sandbox import SubprocessSandbox
+from tools.sandbox.docker_sandbox import DockerSandbox
+from tools.code.shell_tools import BashTool
+
+# 进程级沙箱（跨平台，Unix 支持资源限制）
+sandbox = SubprocessSandbox(timeout=30.0)
+bash = BashTool(sandbox=sandbox)
+
+# 容器级沙箱（需 Docker CLI）
+docker_sandbox = DockerSandbox(
+    image="python:3.11-slim",
+    timeout=60.0,
+    network_disabled=True,
+)
+bash = BashTool(sandbox=docker_sandbox)
+```
+
+### Snapshot / Rollback
+
+```python
+# 手动 snapshot
+snapshot_id = await store.snapshot(label="before-risky-op")
+
+# 执行操作...
+
+# 出错时还原
+await store.restore(snapshot_id)
+
+# ReconcileLoop 自动 rollback（每步 act 前自动打快照）
+agent = Agent(config=config, state_store=store, tool_registry=registry)
+result = await agent.run(
+    goal="Refactor the module",
+    enable_rollback=True,   # act 抛异常 → 自动还原上一步状态
+)
+```
+
+### 步骤回调（流式进度）
+
+```python
+async def on_step(step_result):
+    print(f"Step {step_result.step_number}: {step_result.action}")
+
+result = await agent.run(
+    goal="...",
+    step_callback=on_step,
+)
 ```
 
 ### Human-in-the-Loop
@@ -164,6 +253,34 @@ class MyProbe(QualityProbe):
         )
 ```
 
+### HTTP API 服务器
+
+```bash
+pip install -e ".[api]"
+python -m api.server
+```
+
+```python
+import httpx, asyncio, websockets, json
+
+async def main():
+    async with httpx.AsyncClient() as client:
+        # 创建 run
+        resp = await client.post("http://localhost:8000/runs", json={
+            "goal": "Summarize the codebase structure",
+            "agent_id": "analyst",
+        })
+        run_id = resp.json()["run_id"]
+
+    # WebSocket 实时流式接收步骤事件
+    async with websockets.connect(f"ws://localhost:8000/runs/{run_id}/stream") as ws:
+        async for msg in ws:
+            event = json.loads(msg)
+            print(event)
+
+asyncio.run(main())
+```
+
 ## 架构分层
 
 ```
@@ -171,7 +288,7 @@ Application    ← api/declarative.py  —  AgentFramework, goal(), agent()
 Orchestration  ← core/workflow/      —  WorkflowController, AgentScheduler
 Agent          ← core/agent/         —  Agent, MultiAgentOrchestrator
 Runtime        ← core/runtime/       —  AgentRuntime, ReconcileLoop
-Infra          ← tools/ memory/ core/state/ observability/ probes/
+Infra          ← tools/ memory/ skills/ core/state/ observability/ probes/
 ```
 
 ## 模块一览
@@ -180,65 +297,93 @@ Infra          ← tools/ memory/ core/state/ observability/ probes/
 
 | 模块 | 说明 |
 |------|------|
-| `core/runtime/reconcile_loop.py` | ReconcileLoop ABC + SimpleReconcileLoop |
-| `core/runtime/agent_runtime.py`  | AgentRuntime，集成 Metrics + Human 干预 |
-| `core/runtime/scheduler.py`      | AgentScheduler（优先级队列 + 并发限制） |
-| `core/runtime/human_intervention.py` | HumanInterventionHandler（CLI / Callback） |
+| `core/runtime/reconcile_loop.py` | ReconcileLoop ABC + SimpleReconcileLoop；支持 step_callback、enable_rollback |
+| `core/runtime/agent_runtime.py` | AgentRuntime，集成 Metrics + Human 干预 |
+| `core/runtime/scheduler.py` | AgentScheduler（优先级队列 + 并发限制） |
+| `core/runtime/human_intervention.py` | HumanInterventionHandler（CLI / Callback 两种实现） |
 
 ### 状态存储
 
 | 模块 | 说明 |
 |------|------|
-| `core/state/state_store.py`  | StateStore ABC（乐观锁） |
-| `core/state/sqlite_store.py` | SQLite 实现（开发 / 测试） |
-| `core/state/postgres_store.py` | PostgreSQL 实现（生产，asyncpg）|
-| `core/state/models.py`       | 全部 Pydantic 模型 |
+| `core/state/state_store.py` | StateStore ABC（乐观锁 + snapshot/restore 接口） |
+| `core/state/sqlite_store.py` | SQLite 实现（开发 / 测试，含 state_snapshots 表） |
+| `core/state/postgres_store.py` | PostgreSQL 实现（生产，asyncpg，LISTEN/NOTIFY） |
+| `core/state/models.py` | 全部 Pydantic 模型 |
 
 ### Tool 体系
 
 | 模块 | 说明 |
 |------|------|
-| `tools/base.py`     | ToolBase ABC，副作用四元组声明 |
+| `tools/base.py` | ToolBase ABC；ReadOnlyTool / StateMutatingTool 便捷基类 |
 | `tools/registry.py` | ToolRegistry，权限检查 |
-| `tools/rbac.py`     | RBACManager，Role，内置 read_only / operator / admin |
+| `tools/rbac.py` | RBACManager，Role；内置 read_only / operator / admin |
+| `tools/code/file_tools.py` | ReadFileTool（low）/ WriteFileTool（medium）/ EditFileTool（medium） |
+| `tools/code/search_tools.py` | GlobTool / GrepTool |
+| `tools/code/shell_tools.py` | BashTool（high，沙箱路由）/ KillShellTool（high） |
+
+### 沙箱
+
+| 模块 | 说明 |
+|------|------|
+| `tools/sandbox/base.py` | SandboxBase ABC，SandboxResult，ResourceLimits |
+| `tools/sandbox/subprocess_sandbox.py` | SubprocessSandbox；Unix 支持 rlimit CPU/内存/文件大小/进程数 |
+| `tools/sandbox/docker_sandbox.py` | DockerSandbox；`docker run --rm`，无需 Python docker SDK |
 
 ### 编排层
 
 | 模块 | 说明 |
 |------|------|
-| `core/workflow/workflow.py`   | WorkflowSpec，WorkflowStep |
+| `core/workflow/workflow.py` | WorkflowSpec，WorkflowStep，WorkflowStepStatus |
 | `core/workflow/controller.py` | sequential / parallel / dag 三种执行模式 |
-| `core/agent/multi_agent.py`   | pipeline / supervisor / pool 三种协作模式 |
+| `core/agent/agent.py` | Agent + AgentReconcileLoop；run(step_callback, enable_rollback) |
+| `core/agent/multi_agent.py` | MultiAgentOrchestrator；pipeline / supervisor / pool 三种协作模式 |
 
 ### 质量探针
 
 | 模块 | 说明 |
 |------|------|
-| `probes/quality_probe.py`   | QualityProbe ABC + DefaultQualityProbe + CompositeQualityProbe |
-| `probes/loop_detector.py`   | LoopDetectorProbe（滑动窗口指纹检测） |
-| `probes/confidence_probe.py` | ConfidenceProbe（tool成功率 / 推理质量 / 步骤进展） |
+| `probes/quality_probe.py` | QualityProbe ABC + DefaultQualityProbe + CompositeQualityProbe + ConvergenceCriteriaProbe |
+| `probes/loop_detector.py` | LoopDetectorProbe（滑动窗口，action + tool 指纹检测） |
+| `probes/confidence_probe.py` | ConfidenceProbe（tool 成功率 / 推理质量 / 步骤进展） |
 
 ### 记忆系统
 
 | 模块 | 说明 |
 |------|------|
-| `memory/working.py`        | WorkingMemory（LRU + TTL + 标签过滤） |
+| `memory/working.py` | WorkingMemory（LRU + TTL + 标签过滤） |
 | `memory/context_manager.py` | ContextWindowManager（token 预算，LRU 淘汰） |
-| `memory/episodic.py`       | EpisodicMemory（SQLite，关键词搜索） |
+| `memory/episodic.py` | EpisodicMemory（SQLite 关键词）+ VectorEpisodicMemory（ChromaDB 语义搜索） |
+| `memory/scratchpad.py` | AgentScratchpad（单次 run 内的短暂记事本，无 TTL/LRU） |
+
+### Skill 系统
+
+| 模块 | 说明 |
+|------|------|
+| `skills/base.py` | SkillBase（Pydantic，含 tools + system_prompt_addon + convergence_criteria） |
+| `skills/registry.py` | SkillRegistry（dict 存储，支持按名列举） |
+| `skills/builtin/code_review.py` | 内置 code_review skill |
 
 ### 可观测性
 
 | 模块 | 说明 |
 |------|------|
-| `observability/tracer.py`   | Tracer（JSON 结构化日志）+ OTelTracer（OpenTelemetry） |
-| `observability/metrics.py`  | MetricsCollector（in-memory + Prometheus 导出） |
-| `observability/audit_log.py` | AuditLog（仅追加 SQLite，actor / action 过滤） |
+| `observability/tracer.py` | Tracer（JSON 结构化日志）+ OTelTracer（OpenTelemetry，可选） |
+| `observability/metrics.py` | MetricsCollector（in-memory + Prometheus 导出，全局单例） |
+| `observability/audit_log.py` | AuditLog（仅追加 SQLite，按 actor / action 过滤） |
 
-### 隔离
+### API 服务器
 
 | 模块 | 说明 |
 |------|------|
-| `namespace/namespace.py` | Namespace + NamespaceManager（多租户键前缀隔离） |
+| `api/server.py` | FastAPI 服务器；POST/GET /runs，WS /runs/{id}/stream，GET /health |
+| `api/declarative.py` | AgentFramework（load_skill, configure_agent, run） |
+
+### 多租户
+
+| 模块 | 说明 |
+|------|------|
+| `namespace/namespace.py` | Namespace + NamespaceManager（键前缀隔离，多租户） |
 
 ## Tool 副作用声明
 
@@ -254,22 +399,43 @@ class DeleteFileTool(ToolBase):
 
 `risk_level` 取值：`"low"` | `"medium"` | `"high"`
 
-## StateStore 乐观锁
+## StateStore
+
+### 乐观锁写入
 
 ```python
 entry = await store.get("my-key")
 
-# 乐观锁写入：版本不匹配抛 VersionConflictError
+# 版本不匹配 → 抛 VersionConflictError
 await store.put(
     "my-key",
     {"value": new_value},
     expected_version=entry.version,
     updated_by="my-agent",
 )
+```
 
-# 实时变更通知
+### 实时变更通知
+
+```python
 async for event in store.watch(prefix="tasks/"):
     print(event.key, event.change_type)
+```
+
+### Snapshot / Restore
+
+```python
+# 打快照
+snapshot_id = await store.snapshot(label="pre-migration")
+
+# 查看所有快照
+snapshots = await store.list_snapshots()
+
+# 还原
+await store.restore(snapshot_id)
+
+# 删除快照
+await store.delete_snapshot(snapshot_id)
 ```
 
 ## PostgreSQL（生产环境）
@@ -287,14 +453,17 @@ store = await PostgreSQLStateStore.create(
 ## 运行示例
 
 ```bash
-# Phase 1：基础 ReconcileLoop
+# 基础 ReconcileLoop
 python examples/simple_agent.py
 
-# Phase 2：多 Agent + Workflow
+# 多 Agent + Workflow
 python examples/multi_agent_workflow.py
 
-# Phase 3：Specialist Agent + Scheduler + Metrics + AuditLog
+# Specialist Agent + Scheduler + Metrics + AuditLog
 python examples/specialist_agent.py
+
+# 沙箱、Rollback、API Server、DockerSandbox
+python examples/api_server_example.py
 ```
 
 ## 运行测试
@@ -312,14 +481,16 @@ pytest tests/unit/test_state_store.py -v  # 单个模块
 ```
 AgentFrameworkError
 ├── StateStoreError
-│   └── VersionConflictError      # 乐观锁冲突
+│   └── VersionConflictError        # 乐观锁冲突
 ├── ReconcileError
-│   ├── ConvergenceTimeoutError   # 超过 safety_max_steps
-│   └── LoopDetectedError         # 循环检测触发
+│   ├── ConvergenceTimeoutError     # 超过 safety_max_steps
+│   └── LoopDetectedError           # 循环检测触发
 ├── ToolExecutionError
 ├── ToolPermissionError
-├── HumanInterventionRequired     # 流程控制信号，非错误
-└── QualityProbeFailure           # 携带 ProbeResult
+├── SandboxError                    # 沙箱执行失败（超时 / OOM / 权限）
+├── RollbackError                   # Snapshot restore 失败
+├── HumanInterventionRequired       # 流程控制信号，非错误
+└── QualityProbeFailure             # 携带 ProbeResult
 ```
 
 ## 技术栈
@@ -330,17 +501,11 @@ AgentFrameworkError
 | 状态存储 | SQLite（开发）/ PostgreSQL（生产） |
 | 序列化 | Pydantic v2 |
 | 异步 | asyncio |
-| Trace | OpenTelemetry（可选） |
+| Trace | OpenTelemetry（可选，对接 Langfuse / Jaeger） |
+| 向量记忆 | ChromaDB（可选） |
+| API 服务器 | FastAPI + uvicorn（可选） |
+| 沙箱 | subprocess（内置）/ Docker（需 Docker CLI） |
 | 测试 | pytest + pytest-asyncio |
-
-## 项目状态
-
-| 阶段 | 状态 | 内容 |
-|------|------|------|
-| Phase 1 | 完成 | 核心骨架：异常、StateStore、Tool体系、QualityProbe、ReconcileLoop、Agent、声明式API |
-| Phase 2 | 完成 | 编排层：Workflow+Controller、MultiAgent、RBAC、Namespace、WorkingMemory、EpisodicMemory |
-| Phase 3 | 完成 | 生产就绪：LoopDetector、ConfidenceProbe、Metrics、AuditLog、OTelTracer、Human-in-the-loop、AgentScheduler、PostgreSQL |
-| Phase 4 | 计划中 | 向量记忆（ChromaDB/pgvector）、真实LLM接入、性能基准 |
 
 ## License
 
