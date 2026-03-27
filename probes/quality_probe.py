@@ -119,15 +119,48 @@ class DefaultQualityProbe(QualityProbe):
             "goal reached",
         ]
 
+    @staticmethod
+    def _is_thinking_error(step_output: StepOutput) -> bool:
+        """Return True if the LLM call itself failed (not a tool failure).
+
+        Detected by action starting with 'Error' and no tool calls having run.
+        This covers connection errors, auth errors, and other LLM-level failures.
+        """
+        return (
+            step_output.action.lower().startswith("error")
+            and not step_output.tool_calls
+        )
+
     async def evaluate(
         self,
         step_output: StepOutput,
         context: LoopContext,
     ) -> ProbeResult:
         """Evaluate step output quality."""
+        # LLM-level error (connection refused, auth failure, etc.)
+        if self._is_thinking_error(step_output):
+            consecutive_failures = self._count_consecutive_failures(context, step_output)
+            if consecutive_failures >= self._max_consecutive_failures:
+                return ProbeResult(
+                    verdict="hard_fail",
+                    confidence=0.95,
+                    reason=(
+                        f"LLM call failed {consecutive_failures} times in a row. "
+                        f"Last error: {step_output.reasoning}"
+                    ),
+                    should_converge=False,
+                )
+            return ProbeResult(
+                verdict="soft_fail",
+                confidence=0.5,
+                reason=f"LLM call error (attempt {consecutive_failures}): {step_output.reasoning}",
+                should_converge=False,
+                suggestions=["Check API key and network connectivity"],
+            )
+
         failed_tools = [tc for tc in step_output.tool_calls if not tc.success]
         if failed_tools:
-            consecutive_failures = self._count_consecutive_failures(context)
+            consecutive_failures = self._count_consecutive_failures(context, step_output)
             if consecutive_failures >= self._max_consecutive_failures:
                 return ProbeResult(
                     verdict="hard_fail",
@@ -158,12 +191,27 @@ class DefaultQualityProbe(QualityProbe):
             should_converge=False,
         )
 
-    def _count_consecutive_failures(self, context: LoopContext) -> int:
-        """Count consecutive failed steps from history."""
-        count = 0
+    def _count_consecutive_failures(
+        self, context: LoopContext, current: StepOutput | None = None
+    ) -> int:
+        """Count consecutive failed steps (tool failures + LLM errors) from history.
+
+        Args:
+            context: The current loop context containing step history.
+            current: The step being evaluated now (not yet in history).
+
+        Returns:
+            Number of consecutive failures including the current step.
+        """
+        count = 1 if current is not None and (
+            self._is_thinking_error(current)
+            or any(not tc.success for tc in current.tool_calls)
+        ) else 0
+
         for step in reversed(context.history):
-            has_failure = any(not tc.success for tc in step.tool_calls)
-            if has_failure:
+            is_thinking_err = self._is_thinking_error(step)
+            has_tool_failure = any(not tc.success for tc in step.tool_calls)
+            if is_thinking_err or has_tool_failure:
                 count += 1
             else:
                 break
