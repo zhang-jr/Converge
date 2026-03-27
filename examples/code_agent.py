@@ -117,7 +117,6 @@ async def main() -> None:
     sys.stdout.write("      Without it, the agent uses mock LLM responses.\n\n")
 
     state_store = SQLiteStateStore(":memory:")
-    await state_store.initialize()
 
     sys.stdout.write("--- Scenario 1: Read file + run tests ---\n")
     await demo_read_and_run_tests(state_store)
