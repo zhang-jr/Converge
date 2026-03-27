@@ -1,0 +1,114 @@
+{
+  "_doc": [
+    "Copy this file to llm_providers.json (gitignored, contains your API keys).",
+    "Each provider has one baseUrl + one apiKey, and lists all models it authorizes.",
+    "apiKeyEnv: read key from environment variable (recommended for CI/shared machines).",
+    "apiKey:    inline key (convenient locally, but never commit the real file).",
+    "api:       'openai-completions' | 'anthropic' — tells LiteLLM which protocol to use.",
+    "Select active model: LITELLM_MODEL=<model_id> in .env, or per-agent in AgentConfig."
+  ],
+
+  "providers": {
+    "anthropic": {
+      "api": "anthropic",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "models": [
+        {
+          "id": "claude-opus-4-6",
+          "name": "Claude Opus 4.6",
+          "contextWindow": 200000,
+          "maxTokens": 32000
+        },
+        {
+          "id": "claude-sonnet-4-6",
+          "name": "Claude Sonnet 4.6",
+          "contextWindow": 200000,
+          "maxTokens": 8192
+        },
+        {
+          "id": "claude-haiku-4-5-20251001",
+          "name": "Claude Haiku 4.5",
+          "contextWindow": 200000,
+          "maxTokens": 4096
+        }
+      ]
+    },
+
+    "openai": {
+      "api": "openai-completions",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "models": [
+        {
+          "id": "gpt-4o",
+          "name": "GPT-4o",
+          "contextWindow": 128000,
+          "maxTokens": 16384
+        },
+        {
+          "id": "gpt-4o-mini",
+          "name": "GPT-4o Mini",
+          "contextWindow": 128000,
+          "maxTokens": 16384
+        }
+      ]
+    },
+
+    "nvidia": {
+      "api": "openai-completions",
+      "baseUrl": "https://integrate.api.nvidia.com/v1",
+      "apiKeyEnv": "NVIDIA_API_KEY",
+      "models": [
+        {
+          "id": "moonshotai/kimi-k2.5",
+          "name": "Kimi K2.5",
+          "reasoning": true,
+          "contextWindow": 256000,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0 }
+        },
+        {
+          "id": "meta/llama-3.3-70b-instruct",
+          "name": "Llama 3.3 70B",
+          "contextWindow": 128000,
+          "maxTokens": 4096,
+          "cost": { "input": 0, "output": 0 }
+        }
+      ]
+    },
+
+    "deepseek": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "DeepSeek V3",
+          "contextWindow": 64000,
+          "maxTokens": 8192
+        },
+        {
+          "id": "deepseek-reasoner",
+          "name": "DeepSeek R2",
+          "reasoning": true,
+          "contextWindow": 64000,
+          "maxTokens": 8192
+        }
+      ]
+    },
+
+    "local-ollama": {
+      "api": "openai-completions",
+      "baseUrl": "http://localhost:11434/v1",
+      "apiKey": "ollama",
+      "models": [
+        {
+          "id": "llama3",
+          "name": "Llama 3 (local)",
+          "contextWindow": 8192,
+          "maxTokens": 4096
+        }
+      ]
+    }
+  }
+}
