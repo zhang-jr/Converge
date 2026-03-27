@@ -21,14 +21,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.declarative import AgentFramework
 from core.state.models import AgentConfig
-from core.state.sqlite_store import SQLiteStateStore
 from tools.code.file_tools import EditFileTool, ReadFileTool, WriteFileTool
 from tools.code.search_tools import GlobTool, GrepTool
 from tools.code.shell_tools import BashTool
 from tools.registry import ToolRegistry
 
 
-async def demo_read_and_run_tests(state_store: SQLiteStateStore) -> None:
+async def demo_read_and_run_tests() -> None:
     """Scenario 1: Agent reads a file and runs tests."""
     registry = ToolRegistry()
     registry.register(ReadFileTool())
@@ -42,7 +41,7 @@ async def demo_read_and_run_tests(state_store: SQLiteStateStore) -> None:
 
     registry.grant_permissions("code-agent-1", ["read_file", "bash"])
 
-    framework = AgentFramework(state_store=state_store)
+    framework = AgentFramework(db_path=":memory:")
     framework._tool_registry = registry
     result = await framework.run(
         goal="Read the file 'examples/code_agent.py' and report its line count using bash (wc -l).",
@@ -57,7 +56,7 @@ async def demo_read_and_run_tests(state_store: SQLiteStateStore) -> None:
     sys.stdout.write(f"  Status: {result.status}, Steps: {result.total_steps}\n")
 
 
-async def demo_write_and_edit(state_store: SQLiteStateStore) -> None:
+async def demo_write_and_edit() -> None:
     """Scenario 2: Agent writes a file then edits it."""
     registry = ToolRegistry()
     registry.register(WriteFileTool())
@@ -72,7 +71,7 @@ async def demo_write_and_edit(state_store: SQLiteStateStore) -> None:
 
     registry.grant_permissions("code-agent-2", ["write_file", "edit_file", "read_file"])
 
-    framework = AgentFramework(state_store=state_store)
+    framework = AgentFramework(db_path=":memory:")
     framework._tool_registry = registry
     result = await framework.run(
         goal=(
@@ -86,7 +85,7 @@ async def demo_write_and_edit(state_store: SQLiteStateStore) -> None:
     sys.stdout.write(f"  Status: {result.status}, Steps: {result.total_steps}\n")
 
 
-async def demo_search_codebase(state_store: SQLiteStateStore) -> None:
+async def demo_search_codebase() -> None:
     """Scenario 3: Agent searches the codebase."""
     registry = ToolRegistry()
     registry.register(GlobTool())
@@ -100,7 +99,7 @@ async def demo_search_codebase(state_store: SQLiteStateStore) -> None:
 
     registry.grant_permissions("code-agent-3", ["glob", "grep"])
 
-    framework = AgentFramework(state_store=state_store)
+    framework = AgentFramework(db_path=":memory:")
     framework._tool_registry = registry
     result = await framework.run(
         goal="Find all Python test files in the 'tests/' directory and list them.",
@@ -116,16 +115,14 @@ async def main() -> None:
     sys.stdout.write("NOTE: Set ANTHROPIC_API_KEY in .env to use real LLM.\n")
     sys.stdout.write("      Without it, the agent uses mock LLM responses.\n\n")
 
-    state_store = SQLiteStateStore(":memory:")
-
     sys.stdout.write("--- Scenario 1: Read file + run tests ---\n")
-    await demo_read_and_run_tests(state_store)
+    await demo_read_and_run_tests()
 
     sys.stdout.write("\n--- Scenario 2: Write + Edit file ---\n")
-    await demo_write_and_edit(state_store)
+    await demo_write_and_edit()
 
     sys.stdout.write("\n--- Scenario 3: Glob + Grep search ---\n")
-    await demo_search_codebase(state_store)
+    await demo_search_codebase()
 
     sys.stdout.write("\nPhase 4 demo complete.\n")
 
