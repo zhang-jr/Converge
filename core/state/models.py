@@ -103,6 +103,7 @@ class DesiredState(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     convergence_criteria: list[ConvergenceCriterion] = Field(default_factory=list)
+    planning_strategy: Literal["auto", "always", "never"] = "auto"
 
 
 class ToolCall(BaseModel):

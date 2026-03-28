@@ -156,6 +156,7 @@ class AgentFramework:
         constraints: list[str] | None = None,
         context: dict[str, Any] | None = None,
         agent_config: AgentConfig | None = None,
+        planning_strategy: str = "auto",
     ) -> ReconcileResult:
         """Run an agent to achieve a goal.
 
@@ -164,6 +165,10 @@ class AgentFramework:
             constraints: Optional constraints for the goal.
             context: Optional additional context.
             agent_config: Optional agent configuration override.
+            planning_strategy: Controls LLM planning phase.
+                ``"auto"`` (default) lets the LLM decide whether planning is
+                needed.  ``"always"`` forces planning.  ``"never"`` skips
+                planning entirely (backward compatible with Phase 7 behavior).
 
         Returns:
             ReconcileResult with execution details.
@@ -186,6 +191,7 @@ class AgentFramework:
             constraints=constraints or [],
             context=context or {},
             convergence_criteria=extra_criteria,
+            planning_strategy=planning_strategy,
         )
 
         async with runtime:

@@ -224,14 +224,17 @@ class DefaultQualityProbe(QualityProbe):
     ) -> bool:
         """Check if the goal appears to be achieved.
 
-        Only checks LLM-generated text (action/reasoning), not tool execution
-        result dicts which contain internal status fields like ``status: completed``
-        that are unrelated to goal completion.
+        Checks both action and reasoning text (the action field is truncated
+        to 200 chars by _parse_response for non-JSON responses, so reasoning
+        provides the full LLM output).
+
+        Does not check tool result dicts which contain internal status fields
+        like ``status: completed`` that are unrelated to goal completion.
         """
-        action_str = step_output.action.lower()
+        combined = (step_output.action + " " + step_output.reasoning).lower()
 
         for keyword in self._convergence_keywords:
-            if keyword in action_str:
+            if keyword in combined:
                 return True
 
         return False

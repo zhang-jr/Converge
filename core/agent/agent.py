@@ -16,11 +16,14 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from core.runtime.planning import LLMPlanner
 from core.runtime.reconcile_loop import ReconcileLoop
 from core.state.models import (
     AgentConfig,
     DesiredState,
+    ExecutionPlan,
     LoopContext,
+    PlannedStep,
     ReconcileResult,
     StepOutput,
     ToolCall,
@@ -40,6 +43,8 @@ class AgentReconcileLoop(ReconcileLoop):
     """ReconcileLoop implementation for Agent execution.
 
     Implements the observe/diff/act cycle using LLM calls.
+    Overrides _planning_phase and _reflect_step to integrate LLMPlanner
+    for automatic goal decomposition and adaptive replanning.
     """
 
     def __init__(
@@ -66,6 +71,111 @@ class AgentReconcileLoop(ReconcileLoop):
             enable_rollback=enable_rollback,
         )
         self._agent = agent
+        self._planner = LLMPlanner(model=agent.config.model)
+        self._consecutive_deviations: int = 0
+        self._replan_threshold: int = 2
+
+    async def _planning_phase(
+        self,
+        desired_state: DesiredState,
+        context: LoopContext,
+    ) -> ExecutionPlan | None:
+        """LLM-powered goal decomposition.
+
+        Strategy is controlled by ``desired_state.planning_strategy``:
+        - ``"never"``: skip planning entirely (backward compatible).
+        - ``"always"``: always generate an ExecutionPlan.
+        - ``"auto"``: ask LLM whether the goal needs clarification first,
+          then generate a plan.
+
+        When clarification is needed and a HumanInterventionHandler is
+        available, the user is prompted for more detail.
+        """
+        strategy = desired_state.planning_strategy
+        if strategy == "never":
+            return None
+
+        tool_infos = self._get_available_tool_infos()
+
+        # Auto mode: check clarity first
+        if strategy == "auto":
+            question = await self._planner.should_clarify(
+                desired_state, tool_infos,
+            )
+            if question and self._human_intervention_handler:
+                from errors.exceptions import HumanInterventionRequired
+
+                decision = await self._human_intervention_handler.request_approval(
+                    reason=f"Goal needs clarification: {question}",
+                    context=context,
+                    pending_action={"clarification_question": question},
+                )
+                if decision.feedback:
+                    # Enrich the goal with human feedback
+                    desired_state.context["clarification"] = decision.feedback
+
+        plan = await self._planner.plan(
+            desired_state=desired_state,
+            available_tools=tool_infos,
+            context=desired_state.context,
+            agent_id=self._agent_id or "",
+        )
+        return plan
+
+    async def _reflect_step(
+        self,
+        step_output: StepOutput,
+        planned_step: PlannedStep | None,
+        context: LoopContext,
+    ) -> str:
+        """LLM-powered reflection with adaptive replanning.
+
+        Evaluates whether the step met its planned expectation. If the step
+        deviates and consecutive deviations exceed the threshold, triggers
+        a replan via LLMPlanner.replan().
+        """
+        result = await self._planner.reflect_on_step(step_output, planned_step)
+        reflection = result.get("reflection", "")
+
+        if not result.get("met_expectation", True):
+            self._consecutive_deviations += 1
+        else:
+            self._consecutive_deviations = 0
+
+        # Trigger replan if needed
+        needs_replan = result.get("needs_replan", False)
+        if (needs_replan or self._consecutive_deviations >= self._replan_threshold) \
+                and context.execution_plan is not None:
+            new_info = result.get("new_information", "")
+            if not new_info:
+                new_info = f"Consecutive deviations: {self._consecutive_deviations}"
+
+            tool_infos = self._get_available_tool_infos()
+            new_plan = await self._planner.replan(
+                original_plan=context.execution_plan,
+                completed_steps=context.history,
+                new_information=new_info,
+                available_tools=tool_infos,
+                agent_id=self._agent_id or "",
+            )
+            context.execution_plan = new_plan
+            self._consecutive_deviations = 0
+            reflection += f" [REPLANNED: {new_plan.reasoning}]"
+
+        return reflection
+
+    def _get_available_tool_infos(self) -> list[dict[str, Any]]:
+        """Collect tool info dicts from the registry for prompt injection."""
+        if self._tool_registry is None or not self._agent.config.tools:
+            return []
+        infos = []
+        for tool_name in self._agent.config.tools:
+            try:
+                info = self._tool_registry.get_tool_info(tool_name)
+                infos.append({"name": tool_name, "description": info.get("description", "")})
+            except KeyError:
+                pass
+        return infos
 
     async def _observe(self, context: LoopContext) -> dict[str, Any]:
         """Observe current state including conversation history."""
@@ -74,6 +184,7 @@ class AgentReconcileLoop(ReconcileLoop):
             {
                 "step": s.step_number,
                 "action": s.action,
+                "reasoning": s.reasoning,
                 "result": s.result,
             }
             for s in context.history
@@ -91,6 +202,12 @@ class AgentReconcileLoop(ReconcileLoop):
             if last_step and self._check_goal_achieved(last_step, desired):
                 return None
 
+            # When the agent produces consecutive text-only responses (no tool
+            # calls), it is presenting its final answer rather than working
+            # toward the goal.  Treat this as convergence.
+            if self._is_text_only_convergence(context_history):
+                return None
+
         return {
             "goal": desired.goal,
             "constraints": desired.constraints,
@@ -105,12 +222,39 @@ class AgentReconcileLoop(ReconcileLoop):
     ) -> bool:
         """Simple heuristic to check if goal might be achieved.
 
-        Only checks action text (LLM output), not result dict (tool execution
-        status) to avoid false positives from fields like ``status: completed``.
+        Checks both the action text and the full reasoning (the action field
+        is truncated to 200 chars by _parse_response for non-JSON responses,
+        so the reasoning field provides the complete LLM output).
+
+        Only checks LLM output text, not result dict (tool execution status)
+        to avoid false positives from fields like ``status: completed``.
         """
         action = str(last_step.get("action", "")).lower()
+        reasoning = str(last_step.get("reasoning", "")).lower()
+        combined = action + " " + reasoning
         goal_keywords = ["completed", "done", "finished", "success", "achieved", "goal reached"]
-        return any(kw in action for kw in goal_keywords)
+        return any(kw in combined for kw in goal_keywords)
+
+    def _is_text_only_convergence(
+        self,
+        history: list[dict[str, Any]],
+        consecutive_threshold: int = 2,
+    ) -> bool:
+        """Detect convergence when agent produces consecutive text-only responses.
+
+        When the LLM responds without calling any tools for multiple
+        consecutive steps, it is presenting its final answer rather than
+        actively working toward the goal.  This prevents the loop from
+        running until safety_max_steps when the task is already complete.
+        """
+        if len(history) < consecutive_threshold:
+            return False
+        recent = history[-consecutive_threshold:]
+        return all(
+            isinstance(s.get("result"), dict)
+            and s["result"].get("status") == "no_tools_called"
+            for s in recent
+        )
 
     async def _act(
         self,
@@ -205,6 +349,9 @@ class Agent:
         # Reset scratchpad so each run starts with a clean slate.
         self._scratchpad.clear()
 
+        # Enable planning phase when strategy is not "never"
+        enable_planning = desired_state.planning_strategy != "never"
+
         loop = AgentReconcileLoop(
             agent=self,
             state_store=self._state_store,
@@ -215,6 +362,7 @@ class Agent:
             step_callback=step_callback,
             enable_rollback=enable_rollback,
         )
+        loop._enable_planning = enable_planning
 
         return await loop.run(desired_state)
 
