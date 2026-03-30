@@ -1,5 +1,6 @@
 """Quality probes module."""
 
+from probes.llm_quality_probe import LLMQualityProbe
 from probes.quality_probe import (
     CompositeQualityProbe,
     ConfidenceThresholdProbe,
@@ -14,4 +15,5 @@ __all__ = [
     "DefaultQualityProbe",
     "CompositeQualityProbe",
     "ConfidenceThresholdProbe",
+    "LLMQualityProbe",
 ]
