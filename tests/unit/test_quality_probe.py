@@ -180,6 +180,78 @@ class TestDefaultQualityProbe:
         assert result.should_converge is True
 
 
+class TestNoToolConvergence:
+    """Tests for DefaultQualityProbe._check_no_tool_convergence."""
+
+    async def test_converges_after_successful_tools(
+        self,
+        default_probe: DefaultQualityProbe,
+    ):
+        """No tool calls after prior successful tool steps → converge."""
+        ctx = LoopContext(
+            desired_state=DesiredState(goal="Read the file"),
+            current_step=2,
+            history=[
+                StepOutput(
+                    step_number=1,
+                    action="Calling tools: read_file",
+                    tool_calls=[
+                        ToolCall(tool_name="read_file", success=True, result="file contents")
+                    ],
+                    result={"status": "completed"},
+                ),
+            ],
+            state_snapshot={},
+            agent_id="test-agent",
+            trace_id="test-trace",
+        )
+        step = StepOutput(
+            step_number=2,
+            action="The file has 42 lines",
+            reasoning="Here is the summary of the file.",
+        )
+        result = await default_probe.evaluate(step, ctx)
+        assert result.should_converge is True
+        assert "No tool calls" in result.reason
+
+    async def test_no_convergence_without_history(
+        self,
+        default_probe: DefaultQualityProbe,
+        basic_context: LoopContext,
+    ):
+        """No tool calls but empty history → do not converge."""
+        step = StepOutput(
+            step_number=1,
+            action="Thinking about the problem",
+            reasoning="Let me analyze this.",
+        )
+        result = await default_probe.evaluate(step, basic_context)
+        assert result.should_converge is False
+
+    async def test_no_convergence_when_current_has_tools(
+        self,
+        default_probe: DefaultQualityProbe,
+        basic_context: LoopContext,
+    ):
+        """Current step calls tools → no no-tool convergence."""
+        basic_context.history = [
+            StepOutput(
+                step_number=1,
+                action="Calling tools: bash",
+                tool_calls=[ToolCall(tool_name="bash", success=True)],
+            ),
+        ]
+        step = StepOutput(
+            step_number=2,
+            action="Calling tools: bash",
+            tool_calls=[ToolCall(tool_name="bash", success=True)],
+            result={"status": "completed"},
+        )
+        result = await default_probe.evaluate(step, basic_context)
+        # Should not converge via no-tool check (may converge via keywords though)
+        assert "No tool calls" not in result.reason
+
+
 class TestCompositeQualityProbe:
     """Tests for CompositeQualityProbe."""
 

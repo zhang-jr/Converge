@@ -145,9 +145,21 @@ class TestConfidenceProbe:
     # Convergence detection
     # ------------------------------------------------------------------
 
-    async def test_completion_keyword_in_result(self, probe: ConfidenceProbe) -> None:
-        """Completion keyword in result signals convergence."""
+    async def test_completion_keyword_in_result_not_convergence(
+        self, probe: ConfidenceProbe
+    ) -> None:
+        """Completion keyword in result dict must NOT signal convergence.
+
+        Internal status fields like ``status: completed`` are unrelated
+        to goal completion.
+        """
         step = _step(result={"status": "completed successfully"})
+        result = await probe.evaluate(step, _ctx())
+        assert result.should_converge is False
+
+    async def test_completion_keyword_in_reasoning(self, probe: ConfidenceProbe) -> None:
+        """Completion keyword in reasoning signals convergence."""
+        step = _step(reasoning="The task is now completed and the file has been written.")
         result = await probe.evaluate(step, _ctx())
         assert result.should_converge is True
 

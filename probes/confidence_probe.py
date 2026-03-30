@@ -188,8 +188,11 @@ class ConfidenceProbe(QualityProbe):
         return 0.3
 
     def _check_convergence(self, step_output: StepOutput) -> bool:
-        """Return True when the step result contains completion signal keywords."""
-        result_str = str(step_output.result).lower() if step_output.result else ""
-        action_str = step_output.action.lower()
-        combined = result_str + " " + action_str
+        """Return True when the LLM output text contains completion signal keywords.
+
+        Only checks action and reasoning (LLM-generated text), not
+        step_output.result which contains internal status fields like
+        ``status: completed`` that are unrelated to goal completion.
+        """
+        combined = (step_output.action + " " + step_output.reasoning).lower()
         return any(kw in combined for kw in _COMPLETION_KEYWORDS)

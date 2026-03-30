@@ -240,20 +240,39 @@ class AgentReconcileLoop(ReconcileLoop):
         history: list[dict[str, Any]],
         consecutive_threshold: int = 2,
     ) -> bool:
-        """Detect convergence when agent produces consecutive text-only responses.
+        """Detect convergence when agent produces text-only responses.
 
-        When the LLM responds without calling any tools for multiple
-        consecutive steps, it is presenting its final answer rather than
-        actively working toward the goal.  This prevents the loop from
-        running until safety_max_steps when the task is already complete.
+        Two modes:
+        1. After successful tool-calling steps: a single no-tool step
+           converges (the LLM chose not to call tools = presenting
+           its final answer).
+        2. Otherwise: requires ``consecutive_threshold`` consecutive
+           no-tool steps before converging.
         """
+        if not history:
+            return False
+
+        last = history[-1]
+        last_is_no_tools = (
+            isinstance(last.get("result"), dict)
+            and last["result"].get("status") == "no_tools_called"
+        )
+        if not last_is_no_tools:
+            return False
+
+        # Single no-tool step sufficient after successful tool steps
+        for step in history[:-1]:
+            result = step.get("result")
+            if isinstance(result, dict) and result.get("status") == "completed":
+                return True
+
+        # Fallback: original consecutive threshold logic
         if len(history) < consecutive_threshold:
             return False
-        recent = history[-consecutive_threshold:]
         return all(
             isinstance(s.get("result"), dict)
             and s["result"].get("status") == "no_tools_called"
-            for s in recent
+            for s in history[-consecutive_threshold:]
         )
 
     async def _act(

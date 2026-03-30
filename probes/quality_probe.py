@@ -176,6 +176,14 @@ class DefaultQualityProbe(QualityProbe):
                 suggestions=["Retry with different parameters", "Try alternative approach"],
             )
 
+        if self._check_no_tool_convergence(step_output, context):
+            return ProbeResult(
+                verdict="passed",
+                confidence=0.85,
+                reason="No tool calls after prior successful tool steps — presenting final answer",
+                should_converge=True,
+            )
+
         if self._check_convergence(step_output, context):
             return ProbeResult(
                 verdict="passed",
@@ -216,6 +224,24 @@ class DefaultQualityProbe(QualityProbe):
             else:
                 break
         return count
+
+    def _check_no_tool_convergence(
+        self,
+        step_output: StepOutput,
+        context: LoopContext,
+    ) -> bool:
+        """Detect convergence when LLM stops calling tools after successful tool use.
+
+        If the current step has no tool calls AND at least one previous step
+        had successful tool calls, the LLM is presenting its final answer
+        rather than continuing to work toward the goal.
+        """
+        if step_output.tool_calls:
+            return False
+        for prev_step in context.history:
+            if prev_step.tool_calls and all(tc.success for tc in prev_step.tool_calls):
+                return True
+        return False
 
     def _check_convergence(
         self,
