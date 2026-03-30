@@ -17,6 +17,7 @@ import logging
 import sys
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
@@ -24,6 +25,19 @@ from pydantic import BaseModel, Field
 if TYPE_CHECKING:
     from core.state.models import StepOutput
     from probes.quality_probe import ProbeResult
+
+
+class EventType(StrEnum):
+    """All valid event_type values for TraceEvent."""
+
+    TRACE_START = "trace_start"
+    TRACE_END = "trace_end"
+    STEP = "step"
+    TOOL_CALL = "tool_call"
+    PROBE_RESULT = "probe_result"
+    STATE_CHANGE = "state_change"
+    ERROR = "error"
+    HUMAN_INTERVENTION = "human_intervention"
 
 
 class TraceEvent(BaseModel):
@@ -42,7 +56,7 @@ class TraceEvent(BaseModel):
     trace_id: str
     span_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
     parent_span_id: str | None = None
-    event_type: str
+    event_type: EventType
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     agent_id: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
@@ -134,7 +148,7 @@ class Tracer:
 
         event = TraceEvent(
             trace_id=self._trace_id,
-            event_type="trace_start",
+            event_type=EventType.TRACE_START,
             agent_id=self._agent_id,
             data={"start_time": datetime.utcnow().isoformat()},
         )
@@ -152,7 +166,7 @@ class Tracer:
 
         event = TraceEvent(
             trace_id=self._trace_id,
-            event_type="trace_end",
+            event_type=EventType.TRACE_END,
             agent_id=self._agent_id,
             data={
                 "status": status,
@@ -182,7 +196,7 @@ class Tracer:
 
         event = TraceEvent(
             trace_id=self._trace_id,  # type: ignore
-            event_type="step",
+            event_type=EventType.STEP,
             agent_id=self._agent_id,
             data={
                 "step_number": step_output.step_number,
@@ -226,7 +240,7 @@ class Tracer:
         event = TraceEvent(
             trace_id=self._trace_id,  # type: ignore
             parent_span_id=self._current_span_id,
-            event_type="tool_call",
+            event_type=EventType.TOOL_CALL,
             agent_id=self._agent_id,
             data={
                 "tool_name": tool_name,
@@ -256,7 +270,7 @@ class Tracer:
         event = TraceEvent(
             trace_id=self._trace_id,  # type: ignore
             parent_span_id=self._current_span_id,
-            event_type="probe_result",
+            event_type=EventType.PROBE_RESULT,
             agent_id=self._agent_id,
             data={
                 "probe_name": probe_name,
@@ -294,7 +308,7 @@ class Tracer:
         event = TraceEvent(
             trace_id=self._trace_id,  # type: ignore
             parent_span_id=self._current_span_id,
-            event_type="state_change",
+            event_type=EventType.STATE_CHANGE,
             agent_id=self._agent_id,
             data={
                 "key": key,
@@ -322,7 +336,7 @@ class Tracer:
         event = TraceEvent(
             trace_id=self._trace_id,  # type: ignore
             parent_span_id=self._current_span_id,
-            event_type="error",
+            event_type=EventType.ERROR,
             agent_id=self._agent_id,
             data={
                 "error_type": type(error).__name__,
@@ -355,7 +369,7 @@ class Tracer:
         event = TraceEvent(
             trace_id=self._trace_id,  # type: ignore
             parent_span_id=self._current_span_id,
-            event_type="human_intervention",
+            event_type=EventType.HUMAN_INTERVENTION,
             agent_id=self._agent_id,
             data={
                 "reason": reason,
@@ -380,10 +394,10 @@ class Tracer:
         if not self._events:
             return {}
 
-        steps = [e for e in self._events if e.event_type == "step"]
-        tool_calls = [e for e in self._events if e.event_type == "tool_call"]
-        errors = [e for e in self._events if e.event_type == "error"]
-        probes = [e for e in self._events if e.event_type == "probe_result"]
+        steps = [e for e in self._events if e.event_type == EventType.STEP]
+        tool_calls = [e for e in self._events if e.event_type == EventType.TOOL_CALL]
+        errors = [e for e in self._events if e.event_type == EventType.ERROR]
+        probes = [e for e in self._events if e.event_type == EventType.PROBE_RESULT]
 
         return {
             "trace_id": self._trace_id,
